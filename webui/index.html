@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Decensor · Stash</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="apple-touch-icon-180.png">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header class="topbar">
+    <img class="brand-icon" src="icon.svg" alt="Decensor">
+    <div class="brand-text">
+      <span class="brand-title">Decensor</span>
+      <span class="brand-sub">on-demand mosaic removal</span>
+    </div>
+    <div class="conn" id="conn" title="worker status">connecting…</div>
+  </header>
+
+  <main>
+    <section class="browser">
+      <div class="toolbar">
+        <input id="search" type="search" placeholder="Search scenes by title or path…" autocomplete="off">
+        <select id="sort" title="Sort">
+          <option value="date">Newest</option>
+          <option value="created_at">Recently added</option>
+          <option value="title">Title</option>
+          <option value="file_mod_time">File modified</option>
+          <option value="random">Random</option>
+        </select>
+        <select id="minres" title="Minimum resolution">
+          <option value="0">Any resolution</option>
+          <option value="720">≥ 720p</option>
+          <option value="1080">≥ 1080p</option>
+          <option value="2160">≥ 4K</option>
+        </select>
+        <label class="chk"><input type="checkbox" id="hideDone" checked> Hide decensored</label>
+        <span class="spacer"></span>
+        <button id="decensorSel" class="btn btn-primary" disabled>Decensor selected (0)</button>
+      </div>
+      <div id="grid" class="grid" aria-live="polite"></div>
+      <div class="pager">
+        <button id="prev" class="btn">‹ Prev</button>
+        <span id="pageinfo" class="pageinfo"></span>
+        <button id="next" class="btn">Next ›</button>
+      </div>
+    </section>
+
+    <aside class="jobs">
+      <div class="jobs-head">
+        <h2>Jobs</h2>
+        <button id="clearDone" class="linkbtn">clear finished</button>
+      </div>
+      <div id="joblist"></div>
+      <div id="jobs-empty" class="empty">No jobs yet. Pick scenes and hit <b>Decensor</b>.</div>
+    </aside>
+  </main>
+
+  <div id="toast" class="toast"></div>
+  <script src="app.js"></script>
+</body>
+</html>

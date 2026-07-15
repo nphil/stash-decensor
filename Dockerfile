@@ -62,6 +62,7 @@ RUN ln -sf /usr/bin/ffmpeg /opt/conda/bin/ffmpeg \
 
 WORKDIR /app
 COPY core.py worker.py server.py entrypoint.sh /app/
+COPY webui/ /app/webui/
 RUN chmod +x /app/entrypoint.sh
 
 # Defaults tuned for the Tesla P40 + unRAID. Override in your compose/template.

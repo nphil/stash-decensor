@@ -24,6 +24,8 @@ import json
 import uuid
 import queue
 import logging
+import mimetypes
+import posixpath
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -38,6 +40,9 @@ logging.basicConfig(
 
 TOKEN = os.environ.get("WORKER_TOKEN", "")
 PORT = core._int(os.environ.get("PORT", "8710"), 8710)
+WEBUI_DIR = os.environ.get(
+    "WEBUI_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui")
+)
 
 # Per-request overrides the UI may send -> cfg keys.
 OVERRIDES = {
@@ -210,8 +215,32 @@ class Handler(BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
 
+    def serve_static(self, raw):
+        """Serve the bundled WebUI SPA for any GET not under /api."""
+        rel = posixpath.normpath("/" + raw).lstrip("/") or "index.html"
+        full = os.path.join(WEBUI_DIR, rel.replace("/", os.sep))
+        root = os.path.abspath(WEBUI_DIR)
+        if not os.path.abspath(full).startswith(root) or not os.path.isfile(full):
+            full = os.path.join(WEBUI_DIR, "index.html")  # SPA fallback for unknown routes
+        try:
+            with open(full, "rb") as fh:
+                body = fh.read()
+        except OSError:
+            return self._send(404, {"error": "WebUI not installed on this worker"})
+        ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-cache")
+        self._cors()
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
-        path = self.path.split("?", 1)[0].rstrip("/")
+        raw = self.path.split("?", 1)[0]
+        if not raw.startswith("/api"):
+            return self.serve_static(raw)
+        path = raw.rstrip("/")
         if path == "/api/health":
             return self._send(200, {
                 "ok": True,

@@ -744,6 +744,18 @@ def replace_original(stash, cfg, info, progress=None):
     scan_and_wait(stash, os.path.dirname(orig_path))
     # Clear the now-moved preview file from the output library.
     scan_and_wait(stash, cfg["outputDir"])
+
+    # Tag the original as done so dashboards/tag views can filter it out.
+    try:
+        done = stash.find_tag(cfg.get("doneTag", "Decensored"), create=True)
+        cur = stash.find_scene(int(info["orig_scene_id"]), fragment="id tags { id }")
+        if done and cur:
+            ids = {t["id"] for t in cur.get("tags", [])}
+            ids.add(done["id"])
+            stash.update_scene({"id": info["orig_scene_id"], "tag_ids": list(ids)})
+    except Exception as exc:  # noqa: BLE001 - tagging is best-effort
+        log.warning(f"Could not tag original as done: {exc}")
+
     p(1.0, "Replaced")
     return info["orig_scene_id"]
 

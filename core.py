@@ -293,6 +293,27 @@ BACKENDS = {
 # stash import / metadata
 # --------------------------------------------------------------------------- #
 
+def _chown_like(target, reference):
+    """Best-effort: give `target` the same owner/group as `reference`.
+
+    The worker runs as root, so files it writes are root-owned, whereas the media
+    library is owned by Stash's user (e.g. PUID 99 on unRAID). Matching the
+    reference keeps Stash able to delete/organize the file. No-op where os.chown
+    is unavailable (e.g. Windows) or not permitted.
+    """
+    chown = getattr(os, "chown", None)
+    if chown is None:
+        return
+    try:
+        st = os.stat(reference)
+    except OSError:
+        return
+    try:
+        chown(target, st.st_uid, st.st_gid)
+    except OSError:
+        pass
+
+
 def unique_path(directory, stem, ext):
     candidate = os.path.join(directory, f"{stem}{ext}")
     counter = 1
@@ -388,6 +409,7 @@ def process_scene(stash, cfg, scene, trigger_tag_id, done_tag_id):
         ext = os.path.splitext(produced)[1] or ".mp4"
         dest = unique_path(cfg["outputDir"], f"{stem}_decensored", ext)
         shutil.move(produced, dest)
+        _chown_like(dest, input_path)
         log.info(f"Wrote cleaned file: {dest}")
 
         if cfg["importResult"]:
@@ -645,6 +667,7 @@ def process_to_review(stash, cfg, scene_id, progress=None):
         ext = os.path.splitext(produced)[1] or ".mp4"
         dest = unique_path(cfg["outputDir"], f"{stem}_decensored", ext)
         shutil.move(produced, dest)
+        _chown_like(dest, input_path)
 
         scan_and_wait(stash, cfg["outputDir"])
         matches = stash.find_scenes(
@@ -687,6 +710,12 @@ def replace_original(stash, cfg, info, progress=None):
     review_id = info.get("review_scene_id")
     if not os.path.isfile(dest):
         raise RuntimeError(f"Decensored file missing at {dest}")
+    # Capture the original owner so the replaced file keeps it (worker runs as root;
+    # a root-owned file would block Stash from deleting/organizing it afterwards).
+    try:
+        orig_stat = os.stat(orig_path)
+    except OSError:
+        orig_stat = None
 
     p(0.2, "Removing preview entry")
     if review_id:
@@ -705,6 +734,11 @@ def replace_original(stash, cfg, info, progress=None):
 
     p(0.4, "Replacing original file")
     shutil.move(dest, orig_path)  # overwrite original bytes in place
+    if orig_stat is not None and hasattr(os, "chown"):
+        try:
+            os.chown(orig_path, orig_stat.st_uid, orig_stat.st_gid)
+        except OSError:
+            pass
 
     p(0.6, "Rescanning original")
     scan_and_wait(stash, os.path.dirname(orig_path))

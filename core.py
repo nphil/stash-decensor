@@ -680,7 +680,7 @@ def stash_from_env():
 PREVIEW_TAG = "Decensored (preview)"
 
 
-_RE_FRAMES = re.compile(r"(\d+)\s*/\s*(\d+)")
+_RE_FRAMES = re.compile(r"(\d+)\s*/\s*(\d+)\s*\[")  # tqdm "27/60 [..]" — avoids stray ratios
 _RE_FPS = re.compile(r"([\d.]+)\s*(?:frame/s|frames/s|it/s|fps)", re.IGNORECASE)
 _RE_PCT = re.compile(r"(\d{1,3})%")
 

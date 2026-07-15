@@ -1,0 +1,60 @@
+# Decensor worker for unRAID / Docker  (BeastNAS deploy).
+#
+# Build & run from this directory:  docker compose up -d --build
+#
+# Secrets come from a local .env file next to this compose (gitignored):
+#   STASH_API_KEY=<from Stash > Settings > Security, or its config.yml>
+#   WORKER_TOKEN=<shared secret; set the same value in the plugin's Worker Token>
+#
+# CRITICAL — path matching: media is mounted at the SAME container paths Stash
+# uses (/stuff, /stuff2) so the absolute paths Stash stores resolve here too.
+# On BeastNAS the Stash container maps:
+#   /mnt/user/Download/torrents/Stuff -> /stuff
+#   /mnt/user/Stuff                   -> /stuff2
+services:
+  decensor:
+    build: .
+    image: stashy-decensor:latest
+    container_name: stashy-decensor
+    runtime: nvidia          # unRAID Docker tab: also add "--runtime=nvidia" in Extra Parameters
+    ports:
+      - "8710:8710"          # the on-demand HTTP API the Stash UI button calls
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+
+      # --- mode ---
+      RUN_MODE: "server"                 # server = on-demand UI button (default); worker = tag batch
+      PORT: "8710"
+      WORKER_TOKEN: "${WORKER_TOKEN:-}"  # from .env
+
+      # --- connection ---
+      STASH_URL: "http://192.168.1.69:6969"   # Stash on BeastNAS (host port 6969 -> container 9999)
+      STASH_API_KEY: "${STASH_API_KEY:-}"     # from .env (Stash auth is enabled)
+
+      # --- pipeline (defaults tuned for the Tesla P40) ---
+      BACKEND: "deepmosaics"             # deepmosaics | realesrgan | command
+      POST_UPSCALE: "true"               # DeepMosaics -> Real-ESRGAN (best quality)
+      REALESRGAN_MODEL: "realesr-animevideov3"
+      REALESRGAN_SCALE: "2"
+      REALESRGAN_FP32: "true"            # Tesla P40: KEEP true (Pascal fp16 is ~1/64 speed)
+      REALESRGAN_TILE: "0"               # set e.g. 512 if you OOM on 4K
+      GPU_ID: "0"
+
+      # --- library ---
+      OUTPUT_DIR: "/stuff2/decensored"   # inside the /stuff2 library so previews scan in
+    volumes:
+      - /mnt/user/Download/torrents/Stuff:/stuff     # == Stash's /stuff
+      - /mnt/user/Stuff:/stuff2                       # == Stash's /stuff2
+      - /mnt/user/appdata/decensor/models:/models     # persists the DeepMosaics .pth weights
+    restart: unless-stopped
+
+# unRAID without the compose plugin? Equivalent docker run (fill in the secrets):
+#
+#   docker run -d --name stashy-decensor --runtime=nvidia -p 8710:8710 \
+#     -e NVIDIA_VISIBLE_DEVICES=all -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
+#     -e STASH_URL=http://192.168.1.69:6969 -e STASH_API_KEY=<key> -e WORKER_TOKEN=<token> \
+#     -e POST_UPSCALE=true -e REALESRGAN_FP32=true -e OUTPUT_DIR=/stuff2/decensored \
+#     -v /mnt/user/Download/torrents/Stuff:/stuff -v /mnt/user/Stuff:/stuff2 \
+#     -v /mnt/user/appdata/decensor/models:/models \
+#     stashy-decensor:latest

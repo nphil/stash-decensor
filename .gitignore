@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+
+# local model/data mounts (never commit media or weights)
+models/
+data/
+*.pth
+
+# secrets & host-local overrides (never commit)
+.env
+docker-compose.override.yml

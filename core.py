@@ -1,0 +1,730 @@
+"""Shared decensor pipeline logic.
+
+Used by two entrypoints:
+  - plugin.py : in-Stash raw plugin (reads server_connection from stdin)
+  - worker.py : standalone Docker daemon (connects via STASH_URL + API key)
+
+Both build a StashInterface + a config dict and call run(). Logging is
+injectable via set_log() so the plugin can route to Stash's native log/progress
+while the worker logs plainly to stdout.
+"""
+
+import os
+import re
+import shlex
+import shutil
+import logging
+import tempfile
+import subprocess
+from urllib.parse import urlparse
+
+
+# --------------------------------------------------------------------------- #
+# logging (injectable)
+# --------------------------------------------------------------------------- #
+
+class _StdLog:
+    """Default logger: plain Python logging, plus a progress() shim so it is
+    API-compatible with stashapi.log."""
+
+    def __init__(self, logger=None):
+        self._l = logger or logging.getLogger("decensor")
+
+    def debug(self, m):
+        self._l.debug(m)
+
+    def info(self, m):
+        self._l.info(m)
+
+    def warning(self, m):
+        self._l.warning(m)
+
+    def error(self, m):
+        self._l.error(m)
+
+    def progress(self, frac):
+        try:
+            self._l.info(f"progress: {float(frac) * 100:.0f}%")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+log = _StdLog()
+
+
+def set_log(obj):
+    """Swap the logger (e.g. plugin.py passes stashapi.log)."""
+    global log
+    log = obj
+
+
+# --------------------------------------------------------------------------- #
+# constants / config
+# --------------------------------------------------------------------------- #
+
+VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm", ".wmv", ".flv", ".ts"}
+
+# Suffixes the various tools tack on; stripped when matching a cleaned file back
+# to its original scene during folder import.
+SUFFIX_RE = re.compile(r"(_decensored|_out|_clean|_cleaned|_tg|_upscaled|_x\d+|_\d+)+$", re.IGNORECASE)
+
+DEFAULTS = {
+    # selection / bookkeeping
+    "triggerTag": "Decensor",
+    "doneTag": "Decensored",
+    "outputDir": "",
+    "importResult": True,
+    "gpuId": 0,
+    # pipeline
+    "backend": "deepmosaics",       # deepmosaics | realesrgan | command
+    "postUpscale": False,           # run Real-ESRGAN after the backend
+    # DeepMosaics
+    "deepMosaicsDir": "",
+    "modelPath": "",
+    "mosaicPositionModelPath": "",   # mosaic_position.pth; "" -> next to modelPath
+    "pythonBin": "python",
+    "maskThreshold": 64,
+    # Real-ESRGAN
+    "realEsrganDir": "",
+    "realEsrganPython": "python",
+    "realEsrganModel": "realesr-animevideov3",
+    "realEsrganScale": 2,
+    "realEsrganFaceEnhance": False,
+    "realEsrganFp32": True,         # Pascal (Tesla P40) has awful fp16 -> keep fp32
+    "realEsrganTile": 0,            # >0 tiles to bound VRAM on big frames
+    # generic command backend
+    "commandTemplate": "",
+}
+
+SCENE_FRAGMENT = """
+id
+title
+details
+date
+rating100
+files { path }
+tags { id name }
+performers { id }
+studio { id }
+"""
+
+
+def _int(value, default=0):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+# --------------------------------------------------------------------------- #
+# validation
+# --------------------------------------------------------------------------- #
+
+def validate(cfg):
+    problems = []
+    if not str(cfg["outputDir"]).strip():
+        problems.append("Output Directory")
+
+    backend = cfg["backend"]
+    if backend not in BACKENDS:
+        problems.append(f"backend '{backend}' (use deepmosaics | realesrgan | command)")
+    if backend == "deepmosaics":
+        if not str(cfg["deepMosaicsDir"]).strip():
+            problems.append("DeepMosaics Directory")
+        if not str(cfg["modelPath"]).strip():
+            problems.append("Clean Model Path")
+    if backend == "realesrgan" or cfg["postUpscale"]:
+        if not str(cfg["realEsrganDir"]).strip():
+            problems.append("Real-ESRGAN Directory")
+    if backend == "command" and not str(cfg["commandTemplate"]).strip():
+        problems.append("Command Template")
+
+    if problems:
+        message = "Missing/invalid config: " + ", ".join(problems)
+        log.error(message)
+        raise ValueError(message)
+
+
+# --------------------------------------------------------------------------- #
+# subprocess helpers
+# --------------------------------------------------------------------------- #
+
+def cuda_env(cfg):
+    """Pin the CUDA device (or force CPU) for tools that honor the env var."""
+    env = os.environ.copy()
+    gpu = _int(cfg["gpuId"])
+    env["CUDA_VISIBLE_DEVICES"] = "" if gpu < 0 else str(gpu)
+    return env
+
+
+def run_cmd(cmd, cwd=None, env=None, tag="proc", on_line=None):
+    """Run a command, streaming output. Each line is passed to on_line (for live
+    progress parsing) and the last 15 lines are logged at debug on completion."""
+    log.debug("Running: " + " ".join(cmd))
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+    )
+    tail = []
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        tail.append(line)
+        if len(tail) > 15:
+            tail.pop(0)
+        if on_line:
+            try:
+                on_line(line)
+            except Exception:  # noqa: BLE001 - progress parsing must never break the run
+                pass
+    proc.wait()
+    for line in tail:
+        log.debug(f"[{tag}] {line}")
+    if proc.returncode != 0:
+        raise RuntimeError(f"{tag} exited with code {proc.returncode}")
+
+
+def newest_video(result_dir):
+    vids = [
+        os.path.join(result_dir, f)
+        for f in os.listdir(result_dir)
+        if os.path.splitext(f)[1].lower() in VIDEO_EXTS
+    ]
+    if not vids:
+        raise RuntimeError(f"No video output was produced in {result_dir}")
+    vids.sort(key=os.path.getmtime)
+    return vids[-1]
+
+
+# --------------------------------------------------------------------------- #
+# backends: (cfg, input_path, result_dir) -> produced_video_path
+# --------------------------------------------------------------------------- #
+
+def backend_deepmosaics(cfg, input_path, result_dir, on_line=None):
+    dm_dir = cfg["deepMosaicsDir"]
+    script = os.path.join(dm_dir, "deepmosaic.py")
+    if not os.path.isfile(script):
+        raise RuntimeError(f"deepmosaic.py not found at {script}")
+    # 'clean' mode needs the mosaic-position model too. Left at DeepMosaics'
+    # default ('auto') it looks for mosaic_position.pth beside the clean model
+    # and, if absent, calls input() -> EOFError in a headless container (hang/abort).
+    # Resolve it explicitly so a missing file fails loudly instead.
+    pos_model = str(cfg.get("mosaicPositionModelPath") or "").strip()
+    if not pos_model:
+        pos_model = os.path.join(os.path.dirname(cfg["modelPath"]), "mosaic_position.pth")
+    if not os.path.isfile(pos_model):
+        raise RuntimeError(
+            f"DeepMosaics position model not found at {pos_model}. It ships in the "
+            "DeepMosaics pretrained-models folder alongside clean_youknow_video.pth; "
+            "set MOSAIC_POSITION_MODEL_PATH or drop mosaic_position.pth into /models."
+        )
+    temp_dir = tempfile.mkdtemp(prefix="dm_tmp_")
+    try:
+        run_cmd(
+            [
+                cfg["pythonBin"], script,
+                "--mode", "clean",
+                "--model_path", cfg["modelPath"],
+                "--mosaic_position_model_path", pos_model,
+                "--media_path", input_path,
+                "--result_dir", result_dir,
+                "--temp_dir", temp_dir,
+                "--gpu_id", str(_int(cfg["gpuId"])),
+                "--mask_threshold", str(_int(cfg["maskThreshold"], 64)),
+                "--no_preview",
+            ],
+            cwd=dm_dir, tag="deepmosaics", on_line=on_line,
+        )
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    return newest_video(result_dir)
+
+
+def backend_realesrgan(cfg, input_path, result_dir, on_line=None):
+    re_dir = cfg["realEsrganDir"]
+    script = os.path.join(re_dir, "inference_realesrgan_video.py")
+    if not os.path.isfile(script):
+        raise RuntimeError(f"inference_realesrgan_video.py not found at {script}")
+    cmd = [
+        cfg["realEsrganPython"], script,
+        "-i", input_path,
+        "-o", result_dir,
+        "-n", str(cfg["realEsrganModel"]),
+        "-s", str(cfg["realEsrganScale"]),
+        "--suffix", "out",
+    ]
+    # Pascal cards (Tesla P40) are ~1/64 fp16 speed and can NaN in half; fp32 is
+    # both faster and correct there.
+    if cfg.get("realEsrganFp32", True):
+        cmd.append("--fp32")
+    if _int(cfg.get("realEsrganTile", 0)) > 0:
+        cmd += ["-t", str(_int(cfg["realEsrganTile"]))]
+    if cfg.get("realEsrganFaceEnhance"):
+        cmd.append("--face_enhance")
+    run_cmd(cmd, cwd=re_dir, env=cuda_env(cfg), tag="realesrgan", on_line=on_line)
+    return newest_video(result_dir)
+
+
+def backend_command(cfg, input_path, result_dir, on_line=None):
+    """Generic backend. Template placeholders (each must be its own token):
+       {input}      absolute path to the source video
+       {output_dir} directory to write the result into
+       {gpu}        configured GPU id
+    """
+    tokens = shlex.split(cfg["commandTemplate"])
+    subs = {"{input}": input_path, "{output_dir}": result_dir,
+            "{output}": result_dir, "{gpu}": str(_int(cfg["gpuId"]))}
+    argv = []
+    for tok in tokens:
+        for placeholder, value in subs.items():
+            tok = tok.replace(placeholder, value)
+        argv.append(tok)
+    run_cmd(argv, env=cuda_env(cfg), tag="command", on_line=on_line)
+    return newest_video(result_dir)
+
+
+BACKENDS = {
+    "deepmosaics": backend_deepmosaics,
+    "realesrgan": backend_realesrgan,
+    "command": backend_command,
+}
+
+
+# --------------------------------------------------------------------------- #
+# stash import / metadata
+# --------------------------------------------------------------------------- #
+
+def unique_path(directory, stem, ext):
+    candidate = os.path.join(directory, f"{stem}{ext}")
+    counter = 1
+    while os.path.exists(candidate):
+        candidate = os.path.join(directory, f"{stem}_{counter}{ext}")
+        counter += 1
+    return candidate
+
+
+def apply_metadata(stash, new_id, original, trigger_tag_id, done_tag_id):
+    tag_ids = {t["id"] for t in original.get("tags", [])}
+    tag_ids.discard(trigger_tag_id)
+    tag_ids.add(done_tag_id)
+    update = {
+        "id": new_id,
+        "tag_ids": list(tag_ids),
+        "performer_ids": [p["id"] for p in original.get("performers", [])],
+    }
+    if original.get("title"):
+        update["title"] = f"{original['title']} (Decensored)"
+    if original.get("studio"):
+        update["studio_id"] = original["studio"]["id"]
+    for field in ("details", "date", "rating100"):
+        if original.get(field) is not None:
+            update[field] = original[field]
+    stash.update_scene(update)
+
+
+def scan_and_wait(stash, path):
+    job_id = stash.metadata_scan(paths=[path])
+    try:
+        stash.wait_for_job(job_id)
+    except Exception as exc:  # noqa: BLE001 - scan may still have succeeded
+        log.warning(f"Timed out waiting for scan job; continuing. ({exc})")
+
+
+def import_result(stash, cfg, original, cleaned_path, trigger_tag_id, done_tag_id):
+    scan_and_wait(stash, cfg["outputDir"])
+    matches = stash.find_scenes(
+        f={"path": {"value": cleaned_path, "modifier": "EQUALS"}}, fragment="id"
+    )
+    if not matches:
+        log.warning(
+            f"Cleaned file scanned but no scene found for {cleaned_path}. "
+            "Is the output directory inside a Stash library path?"
+        )
+        return
+    apply_metadata(stash, matches[0]["id"], original, trigger_tag_id, done_tag_id)
+    log.info(f"Imported cleaned scene as id {matches[0]['id']}")
+
+
+def mark_original_done(stash, original, trigger_tag_id, done_tag_id):
+    tag_ids = {t["id"] for t in original.get("tags", [])}
+    tag_ids.discard(trigger_tag_id)
+    tag_ids.add(done_tag_id)
+    stash.update_scene({"id": original["id"], "tag_ids": list(tag_ids)})
+
+
+# --------------------------------------------------------------------------- #
+# processing
+# --------------------------------------------------------------------------- #
+
+def process_scene(stash, cfg, scene, trigger_tag_id, done_tag_id):
+    files = scene.get("files") or []
+    if not files:
+        log.warning(f"Scene {scene['id']} has no file, skipping.")
+        return False
+    input_path = files[0]["path"]
+    if not os.path.isfile(input_path):
+        log.error(
+            f"Scene {scene['id']} file not found at {input_path}. "
+            "The worker/plugin must see the media at the same path Stash uses."
+        )
+        return False
+
+    log.info(f"[{cfg['backend']}] Decensoring: {scene.get('title') or os.path.basename(input_path)}")
+
+    stage_dirs = []
+
+    def new_dir():
+        d = tempfile.mkdtemp(prefix="decensor_")
+        stage_dirs.append(d)
+        return d
+
+    try:
+        produced = BACKENDS[cfg["backend"]](cfg, input_path, new_dir())
+        if cfg["postUpscale"] and cfg["backend"] != "realesrgan":
+            log.info("Post-processing with Real-ESRGAN upscale")
+            produced = backend_realesrgan(cfg, produced, new_dir())
+
+        os.makedirs(cfg["outputDir"], exist_ok=True)
+        stem = re.sub(r"\s+", "_", os.path.splitext(os.path.basename(input_path))[0])
+        ext = os.path.splitext(produced)[1] or ".mp4"
+        dest = unique_path(cfg["outputDir"], f"{stem}_decensored", ext)
+        shutil.move(produced, dest)
+        log.info(f"Wrote cleaned file: {dest}")
+
+        if cfg["importResult"]:
+            import_result(stash, cfg, scene, dest, trigger_tag_id, done_tag_id)
+
+        mark_original_done(stash, scene, trigger_tag_id, done_tag_id)
+        return True
+    finally:
+        for d in stage_dirs:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def base_stem(name):
+    return SUFFIX_RE.sub("", os.path.splitext(os.path.basename(name))[0])
+
+
+def find_original_by_name(stash, cleaned_path, output_dir):
+    """Best-effort match a cleaned file back to its source scene by filename.
+
+    Skips files under the output dir — those are cleaned outputs, not originals.
+    """
+    base = base_stem(cleaned_path)
+    if not base:
+        return None
+    out_norm = os.path.normpath(output_dir)
+    out_prefix = out_norm + os.sep
+    candidates = stash.find_scenes(
+        f={"path": {"value": base, "modifier": "INCLUDES"}}, fragment=SCENE_FRAGMENT
+    )
+    for scene in candidates:
+        for fobj in scene.get("files", []):
+            path = fobj["path"]
+            norm = os.path.normpath(path)
+            # Skip the cleaned file itself and anything genuinely under output_dir
+            # (use a separator boundary so /out/decensored doesn't match /out/decensored_src).
+            if path == cleaned_path or norm == out_norm or norm.startswith(out_prefix):
+                continue
+            if base_stem(path) == base:
+                return scene
+    return None
+
+
+def import_folder(stash, cfg, trigger_tag_id, done_tag_id):
+    """Manual JavPlayer/GUI flow: scan the output dir, then copy metadata from
+    each cleaned file's matching original."""
+    scan_and_wait(stash, cfg["outputDir"])
+    scenes = stash.find_scenes(
+        f={"path": {"value": cfg["outputDir"], "modifier": "INCLUDES"}},
+        fragment=SCENE_FRAGMENT,
+    )
+    if not scenes:
+        log.info(f"No scenes found under {cfg['outputDir']}.")
+        return
+
+    total, done = len(scenes), 0
+    for index, scene in enumerate(scenes):
+        if any(t["id"] == done_tag_id for t in scene.get("tags", [])):
+            log.progress((index + 1) / total)
+            continue
+        cleaned_path = (scene.get("files") or [{}])[0].get("path", "")
+        original = find_original_by_name(stash, cleaned_path, cfg["outputDir"])
+        if original:
+            apply_metadata(stash, scene["id"], original, trigger_tag_id, done_tag_id)
+            mark_original_done(stash, original, trigger_tag_id, done_tag_id)
+            log.info(f"Matched {os.path.basename(cleaned_path)} -> original {original['id']}")
+            done += 1
+        else:
+            stash.update_scene({"id": scene["id"], "tag_ids": [done_tag_id]})
+            log.warning(f"No original matched for {os.path.basename(cleaned_path)}; tagged done only.")
+        log.progress((index + 1) / total)
+    log.info(f"Folder import complete. {done}/{total} matched to an original.")
+
+
+def scenes_to_process(stash, cfg, scene_ids=None):
+    if scene_ids:
+        out = []
+        for sid in scene_ids:
+            scene = stash.find_scene(int(sid), fragment=SCENE_FRAGMENT)
+            if scene:
+                out.append(scene)
+        return out
+    tag = stash.find_tag(cfg["triggerTag"])
+    if not tag:
+        log.info(f"Trigger tag '{cfg['triggerTag']}' does not exist yet — nothing to do.")
+        return []
+    return stash.find_scenes(
+        f={"tags": {"value": [tag["id"]], "modifier": "INCLUDES_ALL", "depth": 0}},
+        fragment=SCENE_FRAGMENT,
+    )
+
+
+def run(stash, cfg, mode="tagged", scene_ids=None):
+    """Entrypoint shared by plugin.py and worker.py. Returns processed count."""
+    validate(cfg)
+    trigger_tag = stash.find_tag(cfg["triggerTag"], create=True)
+    done_tag = stash.find_tag(cfg["doneTag"], create=True)
+
+    if mode == "import":
+        import_folder(stash, cfg, trigger_tag["id"], done_tag["id"])
+        return 0
+
+    scenes = scenes_to_process(stash, cfg, scene_ids)
+    if not scenes:
+        log.info("No scenes to process.")
+        return 0
+
+    total = len(scenes)
+    chain = " + Real-ESRGAN upscale" if cfg["postUpscale"] and cfg["backend"] != "realesrgan" else ""
+    log.info(f"Processing {total} scene(s) with backend '{cfg['backend']}'{chain}.")
+    succeeded = 0
+    for index, scene in enumerate(scenes):
+        if any(t["id"] == done_tag["id"] for t in scene.get("tags", [])):
+            log.debug(f"Scene {scene['id']} already done, skipping.")
+            log.progress((index + 1) / total)
+            continue
+        try:
+            if process_scene(stash, cfg, scene, trigger_tag["id"], done_tag["id"]):
+                succeeded += 1
+        except Exception as exc:  # noqa: BLE001 - one bad scene shouldn't abort the batch
+            log.error(f"Failed to decensor scene {scene['id']}: {exc}")
+        log.progress((index + 1) / total)
+
+    log.info(f"Done. {succeeded}/{total} scene(s) processed.")
+    return succeeded
+
+
+# --------------------------------------------------------------------------- #
+# env config + connection (used by worker.py and server.py)
+# --------------------------------------------------------------------------- #
+
+_ENV_MAP = {
+    "triggerTag": "TRIGGER_TAG",
+    "doneTag": "DONE_TAG",
+    "outputDir": "OUTPUT_DIR",
+    "gpuId": "GPU_ID",
+    "backend": "BACKEND",
+    "deepMosaicsDir": "DEEPMOSAICS_DIR",
+    "modelPath": "MODEL_PATH",
+    "mosaicPositionModelPath": "MOSAIC_POSITION_MODEL_PATH",
+    "pythonBin": "PYTHON_BIN",
+    "maskThreshold": "MASK_THRESHOLD",
+    "realEsrganDir": "REALESRGAN_DIR",
+    "realEsrganPython": "REALESRGAN_PYTHON",
+    "realEsrganModel": "REALESRGAN_MODEL",
+    "realEsrganScale": "REALESRGAN_SCALE",
+    "realEsrganTile": "REALESRGAN_TILE",
+    "commandTemplate": "COMMAND_TEMPLATE",
+}
+_ENV_BOOL = {
+    "postUpscale": "POST_UPSCALE",
+    "importResult": "IMPORT_RESULT",
+    "realEsrganFp32": "REALESRGAN_FP32",
+    "realEsrganFaceEnhance": "REALESRGAN_FACE_ENHANCE",
+}
+
+
+def env_bool(name, default):
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def config_from_env():
+    cfg = dict(DEFAULTS)
+    for key, env in _ENV_MAP.items():
+        val = os.environ.get(env)
+        if val is not None and val != "":
+            cfg[key] = val
+    for key, env in _ENV_BOOL.items():
+        cfg[key] = env_bool(env, cfg[key])
+    return cfg
+
+
+def stash_from_env():
+    """Build a StashInterface from STASH_URL + STASH_API_KEY."""
+    from stashapi.stashapp import StashInterface  # local import; only needed here
+
+    url = os.environ.get("STASH_URL")
+    if not url:
+        raise ValueError("STASH_URL is required (e.g. http://192.168.1.50:9999).")
+    parsed = urlparse(url if "://" in url else f"http://{url}")
+    conn = {
+        "Scheme": parsed.scheme or "http",
+        "Host": parsed.hostname or "localhost",
+        "Port": parsed.port or (443 if parsed.scheme == "https" else 9999),
+        "Logger": log,
+    }
+    api_key = os.environ.get("STASH_API_KEY")
+    if api_key:
+        conn["ApiKey"] = api_key
+    return StashInterface(conn)
+
+
+# --------------------------------------------------------------------------- #
+# on-demand: decensor one scene -> reviewable preview -> replace / discard
+# --------------------------------------------------------------------------- #
+
+PREVIEW_TAG = "Decensored (preview)"
+
+
+def _band(progress, lo, hi):
+    """Return an on_line callback that maps any NN% in tool output into [lo,hi]."""
+    def on_line(line):
+        m = re.search(r"(\d{1,3})%", line)
+        if m and progress:
+            pct = min(100, int(m.group(1))) / 100.0
+            progress(lo + (hi - lo) * pct, None)
+    return on_line
+
+
+def process_to_review(stash, cfg, scene_id, progress=None):
+    """Decensor a single scene into a reviewable preview scene. Does NOT touch
+    the original. Returns an info dict for a later replace/discard."""
+    def p(frac, msg=None):
+        if progress:
+            progress(frac, msg)
+
+    validate(cfg)
+    p(0.02, "Fetching scene")
+    scene = stash.find_scene(int(scene_id), fragment=SCENE_FRAGMENT)
+    if not scene:
+        raise RuntimeError(f"Scene {scene_id} not found")
+    files = scene.get("files") or []
+    if not files:
+        raise RuntimeError(f"Scene {scene_id} has no file")
+    input_path = files[0]["path"]
+    if not os.path.isfile(input_path):
+        raise RuntimeError(
+            f"File not found at {input_path}. The worker's media mount must match "
+            "the path Stash uses."
+        )
+
+    stage_dirs = []
+
+    def new_dir():
+        d = tempfile.mkdtemp(prefix="decensor_")
+        stage_dirs.append(d)
+        return d
+
+    try:
+        backend = cfg["backend"]
+        upscale = cfg["postUpscale"] and backend != "realesrgan"
+        b_lo, b_hi = (0.05, 0.6) if upscale else (0.05, 0.85)
+
+        p(b_lo, f"Running {backend}")
+        produced = BACKENDS[backend](cfg, input_path, new_dir(), on_line=_band(progress, b_lo, b_hi))
+        if upscale:
+            p(0.6, "Real-ESRGAN upscale")
+            produced = backend_realesrgan(cfg, produced, new_dir(), on_line=_band(progress, 0.6, 0.85))
+
+        p(0.88, "Importing preview into Stash")
+        os.makedirs(cfg["outputDir"], exist_ok=True)
+        stem = re.sub(r"\s+", "_", os.path.splitext(os.path.basename(input_path))[0])
+        ext = os.path.splitext(produced)[1] or ".mp4"
+        dest = unique_path(cfg["outputDir"], f"{stem}_decensored", ext)
+        shutil.move(produced, dest)
+
+        scan_and_wait(stash, cfg["outputDir"])
+        matches = stash.find_scenes(
+            f={"path": {"value": dest, "modifier": "EQUALS"}}, fragment="id"
+        )
+        review_id = matches[0]["id"] if matches else None
+        if review_id:
+            preview_tag = stash.find_tag(PREVIEW_TAG, create=True)
+            update = {"id": review_id, "tag_ids": [preview_tag["id"]]}
+            if scene.get("title"):
+                update["title"] = f"{scene['title']} (Decensored preview)"
+            stash.update_scene(update)
+        else:
+            log.warning(
+                f"Preview file scanned but no scene found for {dest}. "
+                "Is OUTPUT_DIR inside a Stash library path?"
+            )
+
+        p(1.0, "Preview ready")
+        return {
+            "orig_scene_id": scene["id"],
+            "orig_path": input_path,
+            "output_path": dest,
+            "review_scene_id": review_id,
+        }
+    finally:
+        for d in stage_dirs:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def replace_original(stash, cfg, info, progress=None):
+    """Overwrite the original file with the decensored one (no backup),
+    preserving the original scene's metadata/history, and remove the preview."""
+    def p(frac, msg=None):
+        if progress:
+            progress(frac, msg)
+
+    orig_path = info["orig_path"]
+    dest = info["output_path"]
+    review_id = info.get("review_scene_id")
+    if not os.path.isfile(dest):
+        raise RuntimeError(f"Decensored file missing at {dest}")
+
+    p(0.2, "Removing preview entry")
+    if review_id:
+        try:
+            # Delete the DB entry but NOT the file — we are about to move it.
+            stash.destroy_scene(int(review_id), delete_file=False)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"Could not destroy preview scene {review_id}: {exc}")
+
+    if os.path.splitext(dest)[1].lower() != os.path.splitext(orig_path)[1].lower():
+        log.warning(
+            "Decensored container differs from the original extension; keeping the "
+            f"original path {os.path.basename(orig_path)} so the scene identity is "
+            "preserved."
+        )
+
+    p(0.4, "Replacing original file")
+    shutil.move(dest, orig_path)  # overwrite original bytes in place
+
+    p(0.6, "Rescanning original")
+    scan_and_wait(stash, os.path.dirname(orig_path))
+    # Clear the now-moved preview file from the output library.
+    scan_and_wait(stash, cfg["outputDir"])
+    p(1.0, "Replaced")
+    return info["orig_scene_id"]
+
+
+def discard_review(stash, cfg, info):
+    """Delete the preview scene and its file."""
+    review_id = info.get("review_scene_id")
+    if review_id:
+        try:
+            stash.destroy_scene(int(review_id), delete_file=True)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"Could not destroy preview scene {review_id}: {exc}")
+    dest = info.get("output_path")
+    if dest and os.path.isfile(dest):
+        try:
+            os.remove(dest)
+        except OSError:
+            pass

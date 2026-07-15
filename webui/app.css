@@ -32,18 +32,32 @@ body {
 .brand-text { display: flex; flex-direction: column; line-height: 1.1; }
 .brand-title { font-weight: 700; font-size: 17px; }
 .brand-sub { color: var(--muted); font-size: 11px; }
-.conn { margin-left: auto; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.conn { font-size: 12px; color: var(--muted); white-space: nowrap; }
 .conn.ok { color: var(--ok); }
 .conn.err { color: var(--accent); }
+
+/* live GPU meter in the topbar (fills otherwise-empty header space) */
+.gpumeter {
+  margin-left: auto; display: flex; align-items: center; gap: 6px;
+  font: 12px/1 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  color: var(--muted); white-space: nowrap;
+  background: rgba(255,255,255,0.05); border: 1px solid var(--line);
+  border-radius: 7px; padding: 5px 9px;
+}
+.gpumeter .gpudot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
+.gpumeter.busy { color: var(--text); }
+.gpumeter.busy .gpudot { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+.gpumeter + .conn { margin-left: 12px; }
 
 /* ---- layout ---- */
 main {
   display: grid;
-  grid-template-columns: 1fr 360px;
+  grid-template-columns: 1fr 408px;
   gap: 16px;
   padding: 16px;
   align-items: start;
 }
+@media (max-width: 1100px) { main { grid-template-columns: 1fr 360px; } }
 @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
 
 /* ---- toolbar ---- */
@@ -145,3 +159,34 @@ select {
 .stat .sv { font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bar.is-paused .fill { background: #7a8087; }
 .jmsg.paused { color: var(--accent-2); }
+
+/* ---- active job emphasis ---- */
+.job.active { border-color: rgba(232, 93, 74, 0.45); background: linear-gradient(180deg, rgba(232,93,74,0.06), var(--panel-2)); }
+.job .jt { display: flex; align-items: center; gap: 7px; }
+.job .jt .livedot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: none; animation: livepulse 1.4s ease-in-out infinite; }
+@keyframes livepulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+/* ---- live log terminal ---- */
+.logwrap { margin-top: 8px; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; background: #0e1013; }
+.loghead {
+  display: flex; align-items: center; gap: 6px; padding: 5px 9px; cursor: pointer; user-select: none;
+  background: rgba(255, 255, 255, 0.03); font-size: 10px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.05em;
+}
+.loghead:hover { color: var(--text); }
+.loghead .caret { width: 9px; display: inline-block; text-align: center; }
+.loghead .live { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); animation: livepulse 1.4s ease-in-out infinite; }
+.loghead .spacer { flex: 1 1 auto; }
+.loghead .logcount { font-variant-numeric: tabular-nums; opacity: 0.7; }
+.joblog {
+  margin: 0; max-height: 210px; overflow: auto; padding: 7px 9px;
+  font: 11px/1.5 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  white-space: pre-wrap; word-break: break-word;
+}
+.logwrap.collapsed .joblog { display: none; }
+.joblog .ln { color: #8a9299; }
+.joblog .ln.lv-event { color: var(--accent-2); }
+.joblog .ln.lv-info { color: #cfd3d7; }
+.joblog .ln.lv-warn { color: #e0a54a; }
+.joblog .ln.lv-error { color: var(--accent); font-weight: 600; }
+.joblog .empty-log { color: var(--muted); opacity: 0.6; }

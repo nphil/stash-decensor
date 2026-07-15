@@ -29,6 +29,7 @@ import subprocess
 import mimetypes
 import posixpath
 import threading
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import core
@@ -91,6 +92,8 @@ OVERRIDES = {
     "mask_threshold": "maskThreshold",
     "gpu_id": "gpuId",
     "face_enhance": "realEsrganFaceEnhance",
+    "detection_model": "ladaDetModel",     # Lada: v4-fast | v4-accurate | v2
+    "restoration_model": "ladaRestModel",
 }
 
 _jobs = {}
@@ -101,6 +104,101 @@ _stash_lock = threading.Lock()
 _running_job_id = None          # the job whose subprocess is live (for cancel/pause)
 _gpu = {}                       # latest GPU stats, refreshed by gpu_poller
 _gpu_lock = threading.Lock()
+
+# --------------------------------------------------------------------------- #
+# per-job live log buffer
+#
+# Each job gets a bounded ring of recent lines the dashboard tails incrementally
+# (GET /api/jobs/<id>/log?after=<seq>). Three sources feed it, each tagged with a
+# level so the UI can colour them:
+#   event  -> stage transitions (the progress messages: "Running deepmosaics"…)
+#   info/warn/error -> pipeline logging (core.log, routed via JobLog below)
+#   proc   -> raw subprocess output, throttled to a ~1.2s heartbeat (no spam)
+# --------------------------------------------------------------------------- #
+
+BASE_LOG = core.log             # the plain stdout logger; JobLog forwards to it
+LOG_MAX = 400                   # lines retained per job
+_job_logs = {}                  # job_id -> deque[{seq, t, level, text}]
+_job_log_seq = {}               # job_id -> last sequence number
+_job_logs_lock = threading.Lock()
+
+
+def push_log(job_id, text, level="proc"):
+    if not job_id or text is None:
+        return
+    text = str(text).strip()
+    if not text:
+        return
+    if len(text) > 400:
+        text = text[:400] + "…"
+    with _job_logs_lock:
+        dq = _job_logs.get(job_id)
+        if dq is None:
+            dq = _job_logs[job_id] = deque(maxlen=LOG_MAX)
+        seq = _job_log_seq.get(job_id, 0) + 1
+        _job_log_seq[job_id] = seq
+        dq.append({"seq": seq, "t": round(time.time(), 3), "level": level, "text": text})
+
+
+def job_log_cursor(job_id):
+    with _job_logs_lock:
+        return _job_log_seq.get(job_id, 0)
+
+
+def job_log_since(job_id, after):
+    with _job_logs_lock:
+        dq = _job_logs.get(job_id)
+        if not dq:
+            return []
+        return [dict(x) for x in dq if x["seq"] > after]
+
+
+def raw_log_sink(job_id):
+    """A throttled log_cb for raw subprocess lines: drops consecutive duplicates
+    and rate-limits to one line / 1.2s so a chatty tqdm bar becomes a heartbeat
+    rather than a flood."""
+    st = {"t": 0.0, "last": None}
+
+    def sink(line):
+        line = (line or "").strip()
+        if not line or line == st["last"]:
+            return
+        now = time.time()
+        if now - st["t"] < 1.2:
+            return
+        st["t"] = now
+        st["last"] = line
+        push_log(job_id, line, "proc")
+
+    return sink
+
+
+class JobLog:
+    """Routes core.log for the running job into its live-log buffer, while still
+    forwarding everything to stdout. Safe because jobs are serialized on one
+    worker thread; worker_loop swaps this in per job and restores BASE_LOG after.
+    Debug is stdout-only (too noisy for the buffer)."""
+
+    def __init__(self, job_id):
+        self.job_id = job_id
+
+    def debug(self, m):
+        BASE_LOG.debug(m)
+
+    def info(self, m):
+        BASE_LOG.info(m)
+        push_log(self.job_id, m, "info")
+
+    def warning(self, m):
+        BASE_LOG.warning(m)
+        push_log(self.job_id, m, "warn")
+
+    def error(self, m):
+        BASE_LOG.error(m)
+        push_log(self.job_id, m, "error")
+
+    def progress(self, frac):
+        BASE_LOG.progress(frac)
 
 
 def _numf(s):
@@ -181,6 +279,7 @@ def public(job):
         out["elapsed"] = int((job.get("_ended_at") or time.time()) - sa)
     with _gpu_lock:
         out["gpu_stats"] = dict(_gpu)
+    out["log_cursor"] = job_log_cursor(job.get("id"))
     return out
 
 
@@ -192,10 +291,15 @@ def set_job(job_id, **fields):
 
 
 def progress_cb(job_id):
+    last = {"msg": None}
+
     def cb(frac, msg=None, stats=None):
         fields = {"progress": round(float(frac), 3)}
         if msg:
             fields["message"] = msg
+            if msg != last["msg"]:            # a new stage/step -> log it once
+                last["msg"] = msg
+                push_log(job_id, msg, "event")
         if stats:
             for k in ("stage", "frame", "total_frames", "fps", "eta"):
                 if stats.get(k) is not None:
@@ -223,7 +327,8 @@ def do_process(job):
             paused=False, stage=None, frame=None, total_frames=None, fps=None, eta=None)
     cfg = job_config(job)
     stash = get_stash()
-    info = core.process_to_review(stash, cfg, job["scene_id"], progress=progress_cb(job_id))
+    info = core.process_to_review(stash, cfg, job["scene_id"],
+                                  progress=progress_cb(job_id), log_cb=raw_log_sink(job_id))
     set_job(
         job_id, state="review_ready", progress=1.0, message="Preview ready to review",
         review_scene_id=info.get("review_scene_id"), output_path=info.get("output_path"),
@@ -266,14 +371,18 @@ def worker_loop():
             continue
         with _jobs_lock:
             _running_job_id = job_id
+        core.set_log(JobLog(job_id))       # route this job's pipeline logs into its buffer
         try:
             ACTIONS[action](job)
         except core.Cancelled:
+            push_log(job_id, "Cancelled by user", "warn")
             set_job(job_id, state="cancelled", message="Cancelled", paused=False, _ended_at=time.time())
         except Exception as exc:  # noqa: BLE001
             logging.exception(f"Job {job_id} action {action} failed")
+            push_log(job_id, "ERROR: " + str(exc), "error")
             set_job(job_id, state="error", message=str(exc), error=str(exc), _ended_at=time.time())
         finally:
+            core.set_log(BASE_LOG)
             with _jobs_lock:
                 _running_job_id = None
 
@@ -402,12 +511,21 @@ class Handler(BaseHTTPRequestHandler):
             return self.serve_static(raw)
         path = raw.rstrip("/")
         if path == "/api/health":
+            with _gpu_lock:
+                gpu_stats = dict(_gpu)
             return self._send(200, {
                 "ok": True,
                 "gpu": os.environ.get("GPU_ID", "0"),
                 "backend": os.environ.get("BACKEND", "deepmosaics"),
                 "postUpscale": core.env_bool("POST_UPSCALE", False),
+                "lada": bool(os.environ.get("LADA_URL", "").strip()),
+                "gpu_stats": gpu_stats,
             })
+        # Live GPU readout for the always-on topbar meter — cheap and unauth'd
+        # (harmless telemetry; the worker sits behind your proxy's auth anyway).
+        if path == "/api/gpu":
+            with _gpu_lock:
+                return self._send(200, dict(_gpu))
         # Media proxies for the dashboard's <img>/<video> (which can't send the
         # token header) — left open; the worker sits behind your proxy's auth.
         m = re.match(r"^/api/(img|vid)/(\d+)$", path)
@@ -421,6 +539,17 @@ class Handler(BaseHTTPRequestHandler):
             with _jobs_lock:
                 data = [public(j) for j in _jobs.values()]
             return self._send(200, data)
+        m = re.match(r"^/api/jobs/([0-9a-f]+)/log$", path)
+        if m:
+            from urllib.parse import urlparse, parse_qs
+            after = core._int(parse_qs(urlparse(self.path).query).get("after", ["0"])[0], 0)
+            job_id = m.group(1)
+            with _jobs_lock:
+                exists = job_id in _jobs
+            if not exists:
+                return self._send(404, {"error": "no such job"})
+            return self._send(200, {"cursor": job_log_cursor(job_id),
+                                    "lines": job_log_since(job_id, after)})
         m = re.match(r"^/api/jobs/([0-9a-f]+)$", path)
         if m:
             with _jobs_lock:
@@ -505,6 +634,13 @@ def main():
         logging.warning(f"Config not fully valid yet: {exc}")
     if not os.environ.get("STASH_URL"):
         logging.warning("STASH_URL not set — jobs will fail until it is configured.")
+    else:
+        # Build the StashInterface now, while core.log is still BASE_LOG, so its
+        # captured logger doesn't get pinned to a per-job JobLog later.
+        try:
+            get_stash()
+        except Exception as exc:  # noqa: BLE001
+            logging.warning(f"Could not pre-connect to Stash: {exc}")
 
     threading.Thread(target=worker_loop, daemon=True).start()
     threading.Thread(target=gpu_poller, daemon=True).start()

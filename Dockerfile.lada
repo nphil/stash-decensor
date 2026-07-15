@@ -1,0 +1,49 @@
+# Lada compute-node image for the Tesla P40 (Pascal, compute 6.1).
+#
+# The stock ghcr.io/ladaapp image is CUDA 12.8 and errors "no kernel image" on
+# Pascal, so we build from source with Lada's own `nvidia-legacy` extra, which
+# pins torch 2.8.0 / torchvision 0.23.0 from the cu126 index — those wheels
+# still ship sm_61 kernels. Runs fp32 (--no-fp16) since the P40 has no usable
+# fp16. Bundles a static ffmpeg (NVENC + x264) so encoding can use the P40.
+#
+# Build:  docker build -f Dockerfile.lada -t stashy-lada:latest .
+FROM python:3.13-slim-trixie
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_LINK_MODE=copy
+
+# opencv/torch runtime libs + build helpers lada's install needs
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl ca-certificates xz-utils gettext patch \
+        libgl1 libglib2.0-0 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# static ffmpeg + ffprobe with NVENC & x264 (same source Lada's own image uses)
+RUN curl -fsSL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz -o /tmp/ff.tar.xz \
+    && mkdir -p /tmp/ff && tar -xJf /tmp/ff.tar.xz -C /tmp/ff --strip-components=1 \
+    && cp /tmp/ff/bin/ffmpeg /tmp/ff/bin/ffprobe /usr/local/bin/ \
+    && rm -rf /tmp/ff /tmp/ff.tar.xz
+
+# uv (astral) for Lada's dependency resolution
+RUN pip install uv
+
+# Lada source + the Pascal-compatible dependency set (cu126 torch).
+WORKDIR /opt
+RUN git clone --depth 1 https://github.com/ladaapp/lada.git
+WORKDIR /opt/lada
+RUN uv sync --extra nvidia-legacy
+
+COPY lada_runner.py /opt/lada/lada_runner.py
+COPY lada_entrypoint.sh /usr/local/bin/lada_entrypoint.sh
+# normalize line endings (file may transit a Windows checkout) + make executable
+RUN sed -i 's/\r$//' /usr/local/bin/lada_entrypoint.sh && chmod +x /usr/local/bin/lada_entrypoint.sh
+
+ENV LADA_MODEL_WEIGHTS_DIR=/models \
+    LADA_CLI=/opt/lada/.venv/bin/lada-cli \
+    LADA_DIR=/opt/lada \
+    LADA_DEVICE=cuda \
+    PORT=8711
+EXPOSE 8711
+ENTRYPOINT ["/usr/local/bin/lada_entrypoint.sh"]

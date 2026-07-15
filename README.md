@@ -99,8 +99,12 @@ direct links, or drop **both** `.pth` files into `/models` yourself (from the
 | `WORKER_TOKEN` | — | Optional shared secret; set the same value in the plugin's *Worker Token*. |
 | `PORT` | `8710` | HTTP API port (publish it). |
 | `RUN_MODE` | `server` | `server` = UI button; `worker` = tag batch. |
-| `BACKEND` | `deepmosaics` | `deepmosaics` \| `realesrgan` \| `command`. |
-| `POST_UPSCALE` | `true` | Real-ESRGAN after the backend (best quality). |
+| `BACKEND` | `deepmosaics` | `deepmosaics` \| `realesrgan` \| `lada` \| `command`. |
+| `POST_UPSCALE` | `true` | Real-ESRGAN after the backend (best quality; skipped for `lada`). |
+| `LADA_URL` | — | Lada runner base URL, e.g. `http://lada:8711`. Enables the `lada` backend + dashboard engine picker. |
+| `LADA_TOKEN` | — | Shared secret for the runner (compose reuses `WORKER_TOKEN`). |
+| `LADA_SCRATCH` | `/scratch` | Handoff dir both worker & runner mount at the same path. |
+| `LADA_DETECTION_MODEL` | `v4-fast` | or `v4-accurate` (better detection, slower). |
 | `REALESRGAN_MODEL` | `realesr-animevideov3` | or `realesr-general-x4v3`, `RealESRGAN_x4plus`. |
 | `REALESRGAN_SCALE` | `2` | Upscale factor. |
 | `REALESRGAN_FP32` | `true` | **Keep true on the P40.** |
@@ -149,14 +153,25 @@ directory instead:
 
 | Backend | Role |
 |---|---|
-| `deepmosaics` | Mosaic **removal** ([HypoX64/DeepMosaics](https://github.com/HypoX64/DeepMosaics)). |
+| `deepmosaics` | Mosaic **removal** ([HypoX64/DeepMosaics](https://github.com/HypoX64/DeepMosaics)). Fast on the P40. |
+| `lada` | Mosaic **removal + temporal restoration** ([ladaapp/lada](https://github.com/ladaapp/lada): YOLO11 detection + BasicVSR++). Best quality; runs on a separate runner container. Slow on Pascal (fp32). |
 | `realesrgan` | **Restore/upscale** ([xinntao/Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)). Does *not* remove mosaics. |
 | `command` | Any external CLI — **TecoGAN**, a **JavPlayer** wrapper, etc. |
 
-**Recommended:** `deepmosaics` **+ Real-ESRGAN upscale** (`POST_UPSCALE=true`,
-default). DeepMosaics reconstructs the censored region; Real-ESRGAN sharpens and
-upscales. JavPlayer's TecoGAN models look best but are Windows-GUI only — use the
-`command` backend for a headless TecoGAN, or process in JavPlayer manually.
+**Recommended:** `lada` when you can afford the runtime (temporal model = less
+flicker, better reconstruction), `deepmosaics` **+ Real-ESRGAN upscale**
+(`POST_UPSCALE=true`, default) for fast batch work. Pick per job with the
+dashboard's engine dropdown.
+
+### The Lada runner (`Dockerfile.lada`)
+
+Lada's stock Docker image is CUDA 12.8 and **does not run on Pascal** (Tesla
+P40/GTX 10xx: "no kernel image"). `Dockerfile.lada` builds Lada from source with
+its `nvidia-legacy` extra — torch 2.8.0 from the **cu126** index, which still
+ships `sm_61` kernels — and runs fp32 (`--no-fp16`). The compose `lada` service
+wraps it in a small HTTP runner (`lada_runner.py`) the worker dispatches to;
+model weights download on first start into `lada-models/` (~1.5 GB) and results
+hand off via the shared `/scratch` mount. One Lada job runs at a time.
 
 ---
 

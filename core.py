@@ -11,6 +11,8 @@ while the worker logs plainly to stdout.
 
 import os
 import re
+import time
+import uuid
 import shlex
 import signal
 import shutil
@@ -96,6 +98,15 @@ DEFAULTS = {
     "realEsrganTile": 0,            # >0 tiles to bound VRAM on big frames
     # generic command backend
     "commandTemplate": "",
+    # Lada backend (separate GPU runner container; see lada_runner.py)
+    "ladaUrl": "",                   # e.g. http://stashy-lada:8711
+    "ladaToken": "",
+    "ladaScratch": "/scratch",       # shared mount both worker + runner see
+    "ladaRestModel": "basicvsrpp-v1.2",
+    "ladaDetModel": "v4-fast",       # v4-fast | v4-accurate | v2
+    "ladaFp16": False,               # Pascal P40: keep False (no usable fp16)
+    "ladaDevice": "cuda",
+    "ladaEncoder": "",               # "" = lada default; e.g. hevc_nvenc for P40 NVENC
 }
 
 SCENE_FRAGMENT = """
@@ -129,17 +140,19 @@ def validate(cfg):
 
     backend = cfg["backend"]
     if backend not in BACKENDS:
-        problems.append(f"backend '{backend}' (use deepmosaics | realesrgan | command)")
+        problems.append(f"backend '{backend}' (use deepmosaics | realesrgan | lada | command)")
     if backend == "deepmosaics":
         if not str(cfg["deepMosaicsDir"]).strip():
             problems.append("DeepMosaics Directory")
         if not str(cfg["modelPath"]).strip():
             problems.append("Clean Model Path")
-    if backend == "realesrgan" or cfg["postUpscale"]:
+    if backend == "realesrgan" or (cfg["postUpscale"] and backend != "lada"):
         if not str(cfg["realEsrganDir"]).strip():
             problems.append("Real-ESRGAN Directory")
     if backend == "command" and not str(cfg["commandTemplate"]).strip():
         problems.append("Command Template")
+    if backend == "lada" and not str(cfg["ladaUrl"]).strip():
+        problems.append("Lada Runner URL (LADA_URL)")
 
     if problems:
         message = "Missing/invalid config: " + ", ".join(problems)
@@ -168,6 +181,29 @@ class Cancelled(Exception):
 _active = {"proc": None, "cancel": False}
 _active_lock = threading.Lock()
 _HAVE_PGID = hasattr(os, "killpg") and hasattr(os, "getpgid")
+
+# Optional hooks for a job whose real work runs on a remote runner (the Lada
+# backend): the local process signals do nothing there, so pause/resume/cancel
+# forward to the runner via these. Set by the backend for its duration.
+_remote = {"cancel": None, "pause": None, "resume": None}
+
+
+def set_remote_controls(cancel=None, pause=None, resume=None):
+    _remote["cancel"], _remote["pause"], _remote["resume"] = cancel, pause, resume
+
+
+def clear_remote_controls():
+    _remote["cancel"] = _remote["pause"] = _remote["resume"] = None
+
+
+def _fire_remote(name):
+    fn = _remote.get(name)
+    if not fn:
+        return False
+    try:
+        return bool(fn())
+    except Exception:  # noqa: BLE001 - a remote hiccup must not crash control flow
+        return False
 
 
 def reset_cancel():
@@ -203,21 +239,28 @@ def cancel_active():
         _active["cancel"] = True
     # SIGKILL the whole group: reliable, and works even if the job is paused (SIGSTOP).
     _signal_active(getattr(signal, "SIGKILL", signal.SIGTERM))
-    return True
+    _fire_remote("cancel")   # also stop a remote runner job, if any
+    return True              # cancel is authoritative: the flag makes check_cancel() raise
 
 
 def pause_active():
+    # Prefer the remote hook (Lada runner) when present; else signal the local group.
+    if _remote.get("pause"):
+        return _fire_remote("pause")
     return _signal_active(signal.SIGSTOP) if hasattr(signal, "SIGSTOP") else False
 
 
 def resume_active():
+    if _remote.get("resume"):
+        return _fire_remote("resume")
     return _signal_active(signal.SIGCONT) if hasattr(signal, "SIGCONT") else False
 
 
-def run_cmd(cmd, cwd=None, env=None, tag="proc", on_line=None):
+def run_cmd(cmd, cwd=None, env=None, tag="proc", on_line=None, log_cb=None):
     """Run a command, streaming output. Each line is passed to on_line (for live
-    progress parsing); the last 15 lines are logged at debug on completion. The
-    child is its own session leader so the whole group can be paused/cancelled."""
+    progress parsing) and log_cb (for the live-log buffer); the last 15 lines are
+    logged at debug on completion. The child is its own session leader so the
+    whole group can be paused/cancelled."""
     log.debug("Running: " + " ".join(cmd))
     kw = {"cwd": cwd, "env": env, "stdout": subprocess.PIPE,
           "stderr": subprocess.STDOUT, "text": True, "bufsize": 1}
@@ -237,6 +280,11 @@ def run_cmd(cmd, cwd=None, env=None, tag="proc", on_line=None):
                 try:
                     on_line(line)
                 except Exception:  # noqa: BLE001 - progress parsing must never break the run
+                    pass
+            if log_cb:
+                try:
+                    log_cb(line)
+                except Exception:  # noqa: BLE001 - log streaming must never break the run
                     pass
         proc.wait()
     finally:
@@ -268,7 +316,7 @@ def newest_video(result_dir):
 # backends: (cfg, input_path, result_dir) -> produced_video_path
 # --------------------------------------------------------------------------- #
 
-def backend_deepmosaics(cfg, input_path, result_dir, on_line=None):
+def backend_deepmosaics(cfg, input_path, result_dir, on_line=None, log_cb=None):
     dm_dir = cfg["deepMosaicsDir"]
     script = os.path.join(dm_dir, "deepmosaic.py")
     if not os.path.isfile(script):
@@ -301,14 +349,14 @@ def backend_deepmosaics(cfg, input_path, result_dir, on_line=None):
                 "--mask_threshold", str(_int(cfg["maskThreshold"], 64)),
                 "--no_preview",
             ],
-            cwd=dm_dir, tag="deepmosaics", on_line=on_line,
+            cwd=dm_dir, tag="deepmosaics", on_line=on_line, log_cb=log_cb,
         )
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
     return newest_video(result_dir)
 
 
-def backend_realesrgan(cfg, input_path, result_dir, on_line=None):
+def backend_realesrgan(cfg, input_path, result_dir, on_line=None, log_cb=None):
     re_dir = cfg["realEsrganDir"]
     script = os.path.join(re_dir, "inference_realesrgan_video.py")
     if not os.path.isfile(script):
@@ -329,11 +377,11 @@ def backend_realesrgan(cfg, input_path, result_dir, on_line=None):
         cmd += ["-t", str(_int(cfg["realEsrganTile"]))]
     if cfg.get("realEsrganFaceEnhance"):
         cmd.append("--face_enhance")
-    run_cmd(cmd, cwd=re_dir, env=cuda_env(cfg), tag="realesrgan", on_line=on_line)
+    run_cmd(cmd, cwd=re_dir, env=cuda_env(cfg), tag="realesrgan", on_line=on_line, log_cb=log_cb)
     return newest_video(result_dir)
 
 
-def backend_command(cfg, input_path, result_dir, on_line=None):
+def backend_command(cfg, input_path, result_dir, on_line=None, log_cb=None):
     """Generic backend. Template placeholders (each must be its own token):
        {input}      absolute path to the source video
        {output_dir} directory to write the result into
@@ -347,14 +395,123 @@ def backend_command(cfg, input_path, result_dir, on_line=None):
         for placeholder, value in subs.items():
             tok = tok.replace(placeholder, value)
         argv.append(tok)
-    run_cmd(argv, env=cuda_env(cfg), tag="command", on_line=on_line)
+    run_cmd(argv, env=cuda_env(cfg), tag="command", on_line=on_line, log_cb=log_cb)
     return newest_video(result_dir)
+
+
+def backend_lada(cfg, input_path, result_dir, on_line=None, log_cb=None):
+    """Dispatch to a separate Lada GPU runner (lada_runner.py) over HTTP.
+
+    The runner writes the restored file into a shared scratch dir (both
+    containers mount it at the same path); we tail its log — relaying each line
+    through on_line (so the existing frame/fps/progress parser drives the job's
+    stats) and log_cb (live-log) — then move the produced file into result_dir.
+    Cancel/pause/resume forward to the runner via the remote-control hooks."""
+    import requests
+
+    base = str(cfg.get("ladaUrl") or "").rstrip("/")
+    if not base:
+        raise RuntimeError("Lada backend selected but LADA_URL is not set.")
+    token = str(cfg.get("ladaToken") or "")
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["X-Lada-Token"] = token
+
+    scratch = str(cfg.get("ladaScratch") or "/scratch")
+    sub = os.path.join(scratch, "lada_" + uuid.uuid4().hex[:10])
+    os.makedirs(sub, exist_ok=True)
+
+    payload = {
+        "input": input_path,
+        "output_dir": sub,
+        "restoration_model": cfg.get("ladaRestModel") or "basicvsrpp-v1.2",
+        "detection_model": cfg.get("ladaDetModel") or "v4-fast",
+        "fp16": bool(cfg.get("ladaFp16", False)),
+        "device": cfg.get("ladaDevice") or "cuda",
+        "encoder": cfg.get("ladaEncoder") or "",
+    }
+
+    def _post(action):
+        try:
+            r = requests.post(f"{base}/jobs/{rid}/{action}", headers=headers, timeout=10)
+            return r.ok
+        except Exception:  # noqa: BLE001
+            return False
+
+    try:
+        r = requests.post(base + "/run", headers=headers, json=payload, timeout=30)
+        r.raise_for_status()
+        rid = r.json()["id"]
+    except Exception as exc:  # noqa: BLE001
+        shutil.rmtree(sub, ignore_errors=True)
+        raise RuntimeError(f"Lada runner unreachable at {base}: {exc}")
+
+    log.info(f"Lada runner job {rid} on {base}")
+    set_remote_controls(cancel=lambda: _post("cancel"),
+                        pause=lambda: _post("pause"),
+                        resume=lambda: _post("resume"))
+    cursor = 0
+    try:
+        while True:
+            check_cancel()
+            try:
+                jb = requests.get(f"{base}/jobs/{rid}", headers=headers, timeout=20).json()
+            except Exception as exc:  # noqa: BLE001 - transient; keep polling
+                log.warning(f"Lada poll error: {exc}")
+                time.sleep(2)
+                continue
+            try:
+                lg = requests.get(f"{base}/jobs/{rid}/log?after={cursor}", headers=headers, timeout=20).json()
+                for ln in lg.get("lines", []):
+                    text = ln.get("text", "")
+                    if on_line:
+                        try:
+                            on_line(text)      # feeds the frame/fps/progress parser
+                        except Exception:      # noqa: BLE001
+                            pass
+                    if log_cb:
+                        try:
+                            log_cb(text)
+                        except Exception:      # noqa: BLE001
+                            pass
+                cursor = lg.get("cursor", cursor)
+            except Exception:  # noqa: BLE001
+                pass
+            # The runner parses lada-cli's progress into structured fields; relay
+            # them as a synthetic tqdm-style line so _band's parser (frame "N/M [",
+            # fps "it/s") is guaranteed to fire regardless of lada's raw format.
+            if on_line and jb.get("frame") and jb.get("total_frames"):
+                synth = f"{jb['frame']}/{jb['total_frames']} ["
+                if jb.get("fps"):
+                    synth += f" {jb['fps']} it/s"
+                try:
+                    on_line(synth)
+                except Exception:  # noqa: BLE001
+                    pass
+            state = jb.get("state")
+            if state == "done":
+                break
+            if state == "error":
+                raise RuntimeError("Lada runner: " + str(jb.get("error") or jb.get("message") or "failed"))
+            if state == "cancelled":
+                raise Cancelled("cancelled on lada runner")
+            time.sleep(2)
+
+        produced = newest_video(sub)
+        dest = os.path.join(result_dir, os.path.basename(produced))
+        shutil.move(produced, dest)
+        _chown_like(dest, input_path)
+        return dest
+    finally:
+        clear_remote_controls()
+        shutil.rmtree(sub, ignore_errors=True)
 
 
 BACKENDS = {
     "deepmosaics": backend_deepmosaics,
     "realesrgan": backend_realesrgan,
     "command": backend_command,
+    "lada": backend_lada,
 }
 
 
@@ -469,7 +626,7 @@ def process_scene(stash, cfg, scene, trigger_tag_id, done_tag_id):
 
     try:
         produced = BACKENDS[cfg["backend"]](cfg, input_path, new_dir())
-        if cfg["postUpscale"] and cfg["backend"] != "realesrgan":
+        if cfg["postUpscale"] and cfg["backend"] not in ("realesrgan", "lada"):
             log.info("Post-processing with Real-ESRGAN upscale")
             produced = backend_realesrgan(cfg, produced, new_dir())
 
@@ -586,7 +743,7 @@ def run(stash, cfg, mode="tagged", scene_ids=None):
         return 0
 
     total = len(scenes)
-    chain = " + Real-ESRGAN upscale" if cfg["postUpscale"] and cfg["backend"] != "realesrgan" else ""
+    chain = " + Real-ESRGAN upscale" if cfg["postUpscale"] and cfg["backend"] not in ("realesrgan", "lada") else ""
     log.info(f"Processing {total} scene(s) with backend '{cfg['backend']}'{chain}.")
     succeeded = 0
     for index, scene in enumerate(scenes):
@@ -626,12 +783,20 @@ _ENV_MAP = {
     "realEsrganScale": "REALESRGAN_SCALE",
     "realEsrganTile": "REALESRGAN_TILE",
     "commandTemplate": "COMMAND_TEMPLATE",
+    "ladaUrl": "LADA_URL",
+    "ladaToken": "LADA_TOKEN",
+    "ladaScratch": "LADA_SCRATCH",
+    "ladaRestModel": "LADA_RESTORATION_MODEL",
+    "ladaDetModel": "LADA_DETECTION_MODEL",
+    "ladaDevice": "LADA_DEVICE",
+    "ladaEncoder": "LADA_ENCODER",
 }
 _ENV_BOOL = {
     "postUpscale": "POST_UPSCALE",
     "importResult": "IMPORT_RESULT",
     "realEsrganFp32": "REALESRGAN_FP32",
     "realEsrganFaceEnhance": "REALESRGAN_FACE_ENHANCE",
+    "ladaFp16": "LADA_FP16",
 }
 
 
@@ -715,9 +880,12 @@ def _band(progress, lo, hi, stage=None):
     return on_line
 
 
-def process_to_review(stash, cfg, scene_id, progress=None):
+def process_to_review(stash, cfg, scene_id, progress=None, log_cb=None):
     """Decensor a single scene into a reviewable preview scene. Does NOT touch
-    the original. Returns an info dict for a later replace/discard."""
+    the original. Returns an info dict for a later replace/discard.
+
+    log_cb(line), if given, receives every raw subprocess line for the live-log
+    buffer (the HTTP layer throttles it)."""
     def p(frac, msg=None, stats=None):
         check_cancel()
         if progress:
@@ -748,14 +916,16 @@ def process_to_review(stash, cfg, scene_id, progress=None):
 
     try:
         backend = cfg["backend"]
-        upscale = cfg["postUpscale"] and backend != "realesrgan"
+        upscale = cfg["postUpscale"] and backend not in ("realesrgan", "lada")
         b_lo, b_hi = (0.05, 0.6) if upscale else (0.05, 0.85)
 
         p(b_lo, f"Running {backend}", {"stage": backend})
-        produced = BACKENDS[backend](cfg, input_path, new_dir(), on_line=_band(progress, b_lo, b_hi, backend))
+        produced = BACKENDS[backend](cfg, input_path, new_dir(),
+                                     on_line=_band(progress, b_lo, b_hi, backend), log_cb=log_cb)
         if upscale:
             p(0.6, "Real-ESRGAN upscale", {"stage": "realesrgan"})
-            produced = backend_realesrgan(cfg, produced, new_dir(), on_line=_band(progress, 0.6, 0.85, "realesrgan"))
+            produced = backend_realesrgan(cfg, produced, new_dir(),
+                                          on_line=_band(progress, 0.6, 0.85, "realesrgan"), log_cb=log_cb)
 
         p(0.88, "Importing preview into Stash", {"stage": "import"})
         os.makedirs(cfg["outputDir"], exist_ok=True)

@@ -75,6 +75,11 @@
       var h = await workerFetch("health");
       conn.className = "conn ok";
       conn.textContent = "● " + h.backend + " · GPU " + h.gpu + (h.postUpscale ? " · upscale on" : "");
+      var opt = document.querySelector('#engine option[value="lada"]');
+      if (opt) {
+        opt.disabled = !h.lada;
+        opt.textContent = h.lada ? "Lada (temporal)" : "Lada (offline)";
+      }
     } catch (e) {
       conn.className = "conn err"; conn.textContent = "worker unreachable";
     }
@@ -155,9 +160,14 @@
   async function decensorSelected() {
     var ids = Array.from(state.sel);
     if (!ids.length) return;
+    var extra = {};
+    if ($("engine").value === "lada") { extra.backend = "lada"; extra.detection_model = $("ladaq").value; }
     var ok = 0;
     for (var i = 0; i < ids.length; i++) {
-      try { await workerFetch("decensor", { method: "POST", body: JSON.stringify({ scene_id: ids[i] }) }); ok++; }
+      try {
+        await workerFetch("decensor", { method: "POST", body: JSON.stringify(Object.assign({ scene_id: ids[i] }, extra)) });
+        ok++;
+      }
       catch (e) { toast("Failed to queue scene " + ids[i] + ": " + e.message, true); }
     }
     state.sel.clear();
@@ -169,21 +179,63 @@
 
   // ---- jobs -------------------------------------------------------------- //
   var RUNNING = { queued: 1, running: 1, replacing: 1, discarding: 1 };
+  var jobEls = {};                 // jobId -> { el, sig }; persisted across polls
+  state.logs = {};                 // jobId -> { cursor, open, follow, body, count, lines }
+
+  function jobName(j) { return (state.scenes[j.scene_id] || {}).title || ("Scene " + j.scene_id); }
+
+  // Structural signature: rebuild a card only when this changes; otherwise update
+  // it in place so the live-log's DOM and scroll position survive each poll.
+  function jobSig(j) {
+    if (j.state === "review_ready") return "review:" + (j.review_scene_id ? 1 : 0);
+    if (j.state === "replaced" || j.state === "discarded" || j.state === "cancelled") return "done:" + j.state;
+    if (j.state === "error") return "error";
+    return "active:" + j.state;    // queued | running | replacing | discarding
+  }
+  function showsLog(j) { return j.state === "running" || j.state === "error"; }
 
   async function pollJobs() {
     var jobs;
     try { jobs = await workerFetch("jobs"); }
-    catch (e) {
-      if (/Not logged|401/.test(e.message)) { /* token issue */ }
-      return;
-    }
+    catch (e) { return; }
     jobs = jobs.filter(function (j) { return !state.dismissed.has(j.id); });
-    jobs.reverse();
-    joblist.innerHTML = "";
+    jobs.reverse();                                 // newest first
     jobsEmpty.style.display = jobs.length ? "none" : "block";
-    jobs.forEach(function (j) { joblist.appendChild(jobCard(j)); });
+
+    var seen = {};
+    jobs.forEach(function (j) {
+      seen[j.id] = 1;
+      var sig = jobSig(j), entry = jobEls[j.id];
+      if (!entry) {
+        jobEls[j.id] = { el: buildJobCard(j), sig: sig };
+      } else if (entry.sig !== sig) {
+        var fresh = buildJobCard(j);
+        if (entry.el.parentNode) entry.el.parentNode.replaceChild(fresh, entry.el);
+        entry.el = fresh; entry.sig = sig;
+      }
+      updateJobCard(jobEls[j.id].el, j);
+    });
+    Object.keys(jobEls).forEach(function (id) { if (!seen[id]) removeJob(id); });
+    reorderJobs(jobs.map(function (j) { return j.id; }));   // attach new + order; no-op when stable
+    jobs.forEach(function (j) { if (showsLog(j)) fetchLog(j); });
   }
 
+  function removeJob(id) {
+    var e = jobEls[id];
+    if (e && e.el.parentNode) e.el.parentNode.removeChild(e.el);
+    delete jobEls[id]; delete state.logs[id];
+  }
+  // Minimal DOM moves: only touches nodes whose position is actually wrong, so a
+  // running job's scrolled log is left untouched in the steady state.
+  function reorderJobs(order) {
+    order.forEach(function (id, i) {
+      var want = jobEls[id] && jobEls[id].el;
+      if (!want) return;
+      if (joblist.children[i] !== want) joblist.insertBefore(want, joblist.children[i] || null);
+    });
+  }
+
+  // ---- stats + log rendering --------------------------------------------- //
   function statChip(g, label, val) {
     if (val == null || val === "") return;
     var s = el("div", "stat");
@@ -191,8 +243,8 @@
     s.appendChild(el("span", "sv", val));
     g.appendChild(s);
   }
-  function statsGrid(j, pct) {
-    var g = el("div", "stats");
+  function fillStats(g, j, pct) {
+    g.innerHTML = "";
     statChip(g, "progress", pct + "%");
     if (j.stage) statChip(g, "stage", j.stage);
     if (j.frame != null && j.total_frames) statChip(g, "frame", j.frame + " / " + j.total_frames);
@@ -205,13 +257,90 @@
       statChip(g, "vram", Math.round(gp.mem_used) + " / " + Math.round(gp.mem_total) + " MB");
     if (gp.temp != null) statChip(g, "temp", Math.round(gp.temp) + "°C");
     if (gp.power != null) statChip(g, "power", Math.round(gp.power) + " W");
-    return g;
   }
 
-  function jobCard(j) {
-    var name = (state.scenes[j.scene_id] || {}).title || ("Scene " + j.scene_id);
+  function logLine(ln) {
+    var d = el("div", "ln lv-" + (ln.level || "proc"));
+    d.textContent = ln.text;
+    return d;
+  }
+  function applyOpen(wrap, caret, open) {
+    wrap.classList.toggle("collapsed", !open);
+    caret.textContent = open ? "▾" : "▸";
+  }
+  function logBox(j, live) {
+    var wrap = el("div", "logwrap");
+    var head = el("div", "loghead");
+    var caret = el("span", "caret");
+    head.appendChild(caret);
+    head.appendChild(el("span", "loglbl", "live log"));
+    if (live) head.appendChild(el("span", "live"));
+    head.appendChild(el("span", "spacer"));
+    var count = el("span", "logcount");
+    head.appendChild(count);
+    var body = el("pre", "joblog");
+    wrap.appendChild(head); wrap.appendChild(body);
+
+    var store = state.logs[j.id];
+    if (!store) store = state.logs[j.id] = {
+      cursor: 0, open: (j.state === "running" || j.state === "error"), follow: true, lines: [],
+    };
+    store.body = body; store.count = count;
+    if (store.lines.length) store.lines.forEach(function (ln) { body.appendChild(logLine(ln)); });
+    else body.appendChild(el("div", "empty-log", "waiting for output…"));
+    count.textContent = store.lines.length ? store.lines.length + " lines" : "";
+    applyOpen(wrap, caret, store.open);
+    if (store.follow) body.scrollTop = body.scrollHeight;
+
+    head.onclick = function () {
+      store.open = !store.open;
+      applyOpen(wrap, caret, store.open);
+      if (store.open) { store.follow = true; body.scrollTop = body.scrollHeight; }
+    };
+    body.addEventListener("scroll", function () {
+      store.follow = (body.scrollHeight - body.scrollTop - body.clientHeight) < 24;
+    });
+    return wrap;
+  }
+  async function fetchLog(j) {
+    var store = state.logs[j.id];
+    if (!store || !store.body) return;
+    if (j.log_cursor != null && j.log_cursor === store.cursor) return;   // nothing new
+    var res;
+    try { res = await workerFetch("jobs/" + j.id + "/log?after=" + store.cursor); }
+    catch (e) { return; }
+    if (res.cursor != null) store.cursor = res.cursor;
+    if (!res.lines || !res.lines.length) return;
+    var body = store.body, empty = body.querySelector(".empty-log");
+    if (empty) body.removeChild(empty);
+    res.lines.forEach(function (ln) {
+      store.lines.push(ln);
+      body.appendChild(logLine(ln));
+    });
+    while (store.lines.length > 500) { store.lines.shift(); if (body.firstChild) body.removeChild(body.firstChild); }
+    if (store.count) store.count.textContent = store.lines.length + " lines";
+    if (store.follow) body.scrollTop = body.scrollHeight;
+  }
+
+  // ---- job cards --------------------------------------------------------- //
+  function dismissRow(id) {
+    var d = el("div", "row"), b = el("button", "btn", "Dismiss");
+    b.onclick = function () {
+      state.dismissed.add(id); removeJob(id);
+      jobsEmpty.style.display = Object.keys(jobEls).length ? "none" : "block";
+    };
+    d.appendChild(b);
+    return d;
+  }
+
+  function buildJobCard(j) {
     var c = el("div", "job");
-    c.appendChild(el("div", "jt", esc(name)));
+    c._refs = {};
+    var title = el("div", "jt");
+    if (j.state === "running") title.appendChild(el("span", "livedot"));
+    title.appendChild(document.createTextNode(jobName(j)));
+    c._refs.titleText = title.lastChild;
+    c.appendChild(title);
 
     if (j.state === "review_ready") {
       c.appendChild(el("div", "jmsg ok", "Preview ready — review it:"));
@@ -227,38 +356,67 @@
       rep.onclick = function () { rep.disabled = dis.disabled = true; jobAction(j.id, "replace"); };
       dis.onclick = function () { rep.disabled = dis.disabled = true; jobAction(j.id, "discard"); };
       row.appendChild(rep); row.appendChild(dis); c.appendChild(row);
-    } else if (j.state === "replaced" || j.state === "discarded" || j.state === "cancelled") {
-      var done = j.state === "replaced" ? "Original replaced ✓"
-        : (j.state === "cancelled" ? "Cancelled" : "Preview discarded");
-      c.appendChild(el("div", "jmsg" + (j.state === "cancelled" ? "" : " ok"), done));
-      var d = el("div", "row"); var b = el("button", "btn", "Dismiss");
-      b.onclick = function () { state.dismissed.add(j.id); pollJobs(); }; d.appendChild(b); c.appendChild(d);
-    } else if (j.state === "error") {
-      c.appendChild(el("div", "jmsg err", j.error || j.message || "Failed"));
-      var d2 = el("div", "row"); var b2 = el("button", "btn", "Dismiss");
-      b2.onclick = function () { state.dismissed.add(j.id); pollJobs(); }; d2.appendChild(b2); c.appendChild(d2);
-    } else {
-      // queued / running / paused / replacing / discarding
-      var pct = Math.round((j.progress || 0) * 100);
-      c.appendChild(el("div", "jmsg" + (j.paused ? " paused" : ""), esc(j.paused ? "Paused" : (j.message || j.state))));
-      var bar = el("div", "bar" + (j.paused ? " is-paused" : ""));
-      bar.appendChild(el("div", "fill")).style.width = pct + "%";
-      c.appendChild(bar);
-      if (j.state === "running") c.appendChild(statsGrid(j, pct));
-      var ctl = el("div", "row");
-      if (j.state === "running") {
-        var pr = el("button", "btn", j.paused ? "Resume" : "Pause");
-        pr.onclick = function () { pr.disabled = true; jobAction(j.id, j.paused ? "resume" : "pause"); };
-        ctl.appendChild(pr);
-      }
-      if (j.state === "running" || j.state === "queued") {
-        var cx = el("button", "btn btn-danger", "Cancel");
-        cx.onclick = function () { cx.disabled = true; jobAction(j.id, "cancel"); };
-        ctl.appendChild(cx);
-      }
-      if (ctl.children.length) c.appendChild(ctl);
+      return c;
     }
+    if (j.state === "replaced" || j.state === "discarded" || j.state === "cancelled") {
+      var txt = j.state === "replaced" ? "Original replaced ✓"
+        : (j.state === "cancelled" ? "Cancelled" : "Preview discarded");
+      c.appendChild(el("div", "jmsg" + (j.state === "cancelled" ? "" : " ok"), txt));
+      c.appendChild(dismissRow(j.id));
+      return c;
+    }
+    if (j.state === "error") {
+      c._refs.err = el("div", "jmsg err", esc(j.error || j.message || "Failed"));
+      c.appendChild(c._refs.err);
+      c.appendChild(logBox(j, false));
+      c.appendChild(dismissRow(j.id));
+      return c;
+    }
+    // active: queued | running | replacing | discarding
+    if (j.state === "running") c.classList.add("active");
+    c._refs.msg = el("div", "jmsg");
+    c.appendChild(c._refs.msg);
+    var bar = el("div", "bar");
+    c._refs.fill = el("div", "fill");
+    bar.appendChild(c._refs.fill);
+    c._refs.bar = bar;
+    c.appendChild(bar);
+    c._refs.stats = el("div", "stats");
+    c.appendChild(c._refs.stats);
+    if (j.state === "running") c.appendChild(logBox(j, true));
+    var ctl = el("div", "row");
+    if (j.state === "running") {
+      var pr = el("button", "btn", "Pause");
+      pr.onclick = function () { pr.disabled = true; jobAction(j.id, pr.dataset.act || "pause"); };
+      c._refs.pause = pr; ctl.appendChild(pr);
+    }
+    if (j.state === "running" || j.state === "queued") {
+      var cx = el("button", "btn btn-danger", "Cancel");
+      cx.onclick = function () { cx.disabled = true; jobAction(j.id, "cancel"); };
+      ctl.appendChild(cx);
+    }
+    if (ctl.children.length) c.appendChild(ctl);
     return c;
+  }
+
+  function updateJobCard(c, j) {
+    var r = c._refs || {};
+    if (r.titleText) r.titleText.nodeValue = jobName(j);
+    if (j.state === "error") { if (r.err) r.err.textContent = j.error || j.message || "Failed"; return; }
+    if (!r.bar) return;                              // review_ready / done: nothing live
+    var pct = Math.round((j.progress || 0) * 100);
+    if (r.msg) {
+      r.msg.textContent = j.paused ? "Paused" : (j.message || j.state);
+      r.msg.className = "jmsg" + (j.paused ? " paused" : "");
+    }
+    r.bar.className = "bar" + (j.paused ? " is-paused" : "");
+    r.fill.style.width = pct + "%";
+    if (r.stats) fillStats(r.stats, j, pct);
+    if (r.pause) {
+      r.pause.textContent = j.paused ? "Resume" : "Pause";
+      r.pause.dataset.act = j.paused ? "resume" : "pause";
+      r.pause.disabled = false;
+    }
   }
 
   async function jobAction(id, kind) {
@@ -267,11 +425,28 @@
     pollJobs();
   }
 
+  // ---- live GPU meter (topbar) ------------------------------------------- //
+  async function pollGpu() {
+    var box = $("gpumeter"), txt = $("gpumeter-text");
+    if (!box) return;
+    try {
+      var g = await (await fetch(workerUrl("gpu"))).json();
+      if (g && g.util != null) {
+        var vram = (g.mem_used != null && g.mem_total != null)
+          ? " · " + (g.mem_used / 1024).toFixed(1) + "/" + Math.round(g.mem_total / 1024) + " GB" : "";
+        txt.textContent = "GPU " + Math.round(g.util) + "%" + vram + (g.temp != null ? " · " + Math.round(g.temp) + "°C" : "");
+        box.hidden = false;
+        box.classList.toggle("busy", g.util >= 5);
+      } else { box.hidden = true; }
+    } catch (e) { box.hidden = true; }
+  }
+
   // ---- init -------------------------------------------------------------- //
   function bind() {
     var deb;
     $("search").addEventListener("input", function () { clearTimeout(deb); deb = setTimeout(function () { state.page = 1; loadScenes(); }, 300); });
     $("sort").onchange = $("minres").onchange = $("hideDone").onchange = function () { state.page = 1; loadScenes(); };
+    $("engine").onchange = function () { $("ladaq").hidden = $("engine").value !== "lada"; };
     $("prev").onclick = function () { if (state.page > 1) { state.page--; loadScenes(); } };
     $("next").onclick = function () { state.page++; loadScenes(); };
     $("decensorSel").onclick = decensorSelected;
@@ -289,8 +464,10 @@
     await updateConn();
     await loadScenes();
     pollJobs();
+    pollGpu();
     state.pollTimer = setInterval(pollJobs, 1500);
     setInterval(updateConn, 15000);
+    setInterval(pollGpu, 3000);
   }
   main();
 })();

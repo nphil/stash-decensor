@@ -49,12 +49,47 @@ services:
       REALESRGAN_TILE: "0"               # set e.g. 512 if you OOM on 4K
       GPU_ID: "0"
 
+      # --- Lada backend (optional higher-quality engine on a separate runner) ---
+      # Pick backend=lada per job from the dashboard; the worker dispatches to
+      # the `lada` service below and reads the result back off /scratch.
+      LADA_URL: "http://lada:8711"
+      LADA_TOKEN: "${WORKER_TOKEN:-}"
+      LADA_SCRATCH: "/scratch"
+
       # --- library ---
       OUTPUT_DIR: "/stuff2/decensored"   # inside the /stuff2 library so previews scan in
     volumes:
       - /mnt/user/Download/torrents/Stuff:/stuff     # == Stash's /stuff
       - /mnt/user/Stuff:/stuff2                       # == Stash's /stuff2
       - /mnt/user/appdata/decensor/models:/models     # persists the DeepMosaics .pth weights
+      # Shared handoff with the Lada runner. Deliberately OUTSIDE the Stash
+      # libraries so half-written intermediates can never get scanned as scenes.
+      - /mnt/user/appdata/decensor/scratch:/scratch
+    restart: unless-stopped
+
+  # Lada compute node (Pascal cu126 build). Its own container so the worker image
+  # stays lean; this is the first "runner" of the coordinator/runner design.
+  lada:
+    build:
+      context: .
+      dockerfile: Dockerfile.lada
+    image: stashy-lada:latest
+    container_name: stashy-lada
+    labels:
+      net.unraid.docker.icon: "https://raw.githubusercontent.com/nphil/stash-decensor/main/assets/icon-256.png"
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+      LADA_TOKEN: "${WORKER_TOKEN:-}"    # same shared secret the worker sends
+      LADA_DEVICE: "cuda"
+      GPU_ID: "0"
+      PORT: "8711"
+    volumes:
+      - /mnt/user/Download/torrents/Stuff:/stuff:ro   # read inputs at the same paths
+      - /mnt/user/Stuff:/stuff2:ro
+      - /mnt/user/appdata/decensor/scratch:/scratch   # write outputs here (worker reads them)
+      - /mnt/user/appdata/decensor/lada-models:/models  # persists Lada weights (~GB)
     restart: unless-stopped
 
 # unRAID without the compose plugin? Equivalent docker run (fill in the secrets):

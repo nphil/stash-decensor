@@ -20,6 +20,10 @@ services:
     build: .
     image: stashy-decensor:latest
     container_name: stashy-decensor
+    labels:
+      # unRAID Docker tab reads these: container icon + a WebUI link.
+      net.unraid.docker.icon: "https://raw.githubusercontent.com/nphil/stash-decensor/main/assets/icon-256.png"
+      net.unraid.docker.webui: "https://decensor.nateshome.net/"
     runtime: nvidia          # unRAID Docker tab: also add "--runtime=nvidia" in Extra Parameters
     ports:
       - "8710:8710"          # the on-demand HTTP API the Stash UI button calls

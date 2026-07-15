@@ -62,11 +62,13 @@
   }
 
   async function loadToken() {
+    // The worker injects its token into the served page, so the dashboard is
+    // self-contained and works from any origin (e.g. a dedicated subdomain).
+    if (typeof window.__WT === "string" && window.__WT !== "__WORKER_TOKEN__") { TOKEN = window.__WT; return; }
     try {
       var d = await stashGQL("query { configuration { plugins } }");
-      var p = ((d.configuration || {}).plugins || {}).decensor || {};
-      TOKEN = p.workerToken || "";
-    } catch (e) { /* no token; worker may accept unauthenticated */ }
+      TOKEN = (((d.configuration || {}).plugins || {}).decensor || {}).workerToken || "";
+    } catch (e) { /* worker may accept unauthenticated */ }
   }
   async function updateConn() {
     try {
@@ -90,16 +92,16 @@
   async function loadScenes() {
     grid.innerHTML = "<div class='empty'>Loading…</div>";
     var sort = $("sort").value;
-    var dir = (sort === "title") ? "ASC" : "DESC";
-    var vars = { filter: { q: $("search").value.trim(), page: state.page, per_page: PER, sort: sort, direction: dir } };
-    var data;
-    try { data = await stashGQL(SCENE_Q, vars); }
+    var qs = "scenes?q=" + encodeURIComponent($("search").value.trim()) +
+      "&page=" + state.page + "&per_page=" + PER + "&sort=" + encodeURIComponent(sort);
+    var res;
+    try { res = await workerFetch(qs); }
     catch (e) {
-      grid.innerHTML = "<div class='empty'>Couldn't reach Stash: " + esc(e.message) +
-        "<br>Open this page from your Stash domain while logged in.</div>";
+      grid.innerHTML = "<div class='empty'>Couldn't load scenes: " + esc(e.message) +
+        "<br>Check the worker can reach Stash (STASH_URL / API key).</div>";
       return;
     }
-    var res = data.findScenes; state.count = res.count;
+    state.count = res.count;
     var minres = parseInt($("minres").value, 10) || 0;
     var hideDone = $("hideDone").checked;
     grid.innerHTML = "";
@@ -124,7 +126,7 @@
     var card = el("div", "card" + (state.sel.has(s.id) ? " sel" : ""));
     card.dataset.id = s.id;
     var thumb = el("div", "thumb");
-    thumb.style.backgroundImage = "url(/scene/" + s.id + "/screenshot)";
+    thumb.style.backgroundImage = "url(" + workerUrl("img/" + s.id) + ")";
     card.appendChild(thumb);
     if (f.height) card.appendChild(el("span", "badge", resLabel(f.height)));
     card.appendChild(el("div", "tick", "✓"));
@@ -190,7 +192,7 @@
       c.appendChild(el("div", "jmsg ok", "Preview ready — review it:"));
       if (j.review_scene_id) {
         var v = el("video"); v.controls = true; v.preload = "metadata";
-        v.src = "/scene/" + j.review_scene_id + "/stream"; c.appendChild(v);
+        v.src = workerUrl("vid/" + j.review_scene_id); c.appendChild(v);
       } else {
         c.appendChild(el("div", "jmsg", "(preview not indexed yet — Stash was busy; you can still replace)"));
       }

@@ -43,6 +43,42 @@ PORT = core._int(os.environ.get("PORT", "8710"), 8710)
 WEBUI_DIR = os.environ.get(
     "WEBUI_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui")
 )
+STASH_URL_RAW = os.environ.get("STASH_URL", "")
+STASH_API_KEY = os.environ.get("STASH_API_KEY", "")
+
+# Scene fragment the dashboard needs, proxied so the WebUI works from any origin
+# (a dedicated subdomain can't use Stash's session cookie cross-origin).
+SCENES_GQL = (
+    "query($f: FindFilterType){ findScenes(filter:$f){ count scenes {"
+    " id title date files { path width height duration size }"
+    " studio { name } tags { name } } } }"
+)
+
+
+def stash_base():
+    u = STASH_URL_RAW
+    if u and "://" not in u:
+        u = "http://" + u
+    return u.rstrip("/")
+
+
+def stash_gql(query, variables=None):
+    """Server-side GraphQL to Stash using the worker's API key."""
+    import requests
+
+    headers = {"Content-Type": "application/json"}
+    if STASH_API_KEY:
+        headers["ApiKey"] = STASH_API_KEY
+    r = requests.post(
+        stash_base() + "/graphql",
+        json={"query": query, "variables": variables or {}},
+        headers=headers, timeout=30,
+    )
+    r.raise_for_status()
+    j = r.json()
+    if j.get("errors"):
+        raise RuntimeError(j["errors"][0].get("message", "GraphQL error"))
+    return j["data"]
 
 # Per-request overrides the UI may send -> cfg keys.
 OVERRIDES = {
@@ -227,6 +263,8 @@ class Handler(BaseHTTPRequestHandler):
                 body = fh.read()
         except OSError:
             return self._send(404, {"error": "WebUI not installed on this worker"})
+        if full.endswith("index.html"):
+            body = body.replace(b"__WORKER_TOKEN__", TOKEN.encode())  # self-auth the dashboard
         ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
         self.send_response(200)
         self.send_header("Content-Type", ctype)
@@ -235,6 +273,58 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def api_scenes(self):
+        from urllib.parse import urlparse, parse_qs
+
+        q = parse_qs(urlparse(self.path).query)
+
+        def g(k, d):
+            v = q.get(k)
+            return v[0] if v else d
+
+        sort = g("sort", "date")
+        f = {
+            "q": g("q", ""),
+            "page": core._int(g("page", "1"), 1),
+            "per_page": min(60, max(1, core._int(g("per_page", "36"), 36))),
+            "sort": sort,
+            "direction": (g("dir", "") or ("ASC" if sort == "title" else "DESC")).upper(),
+        }
+        try:
+            data = stash_gql(SCENES_GQL, {"f": f})
+            return self._send(200, data["findScenes"])
+        except Exception as exc:  # noqa: BLE001
+            return self._send(502, {"error": "stash: " + str(exc)})
+
+    def proxy_media(self, kind, scene_id):
+        """Relay a Stash screenshot/stream through the worker (with the API key)
+        so the dashboard's <img>/<video> work without Stash's cookie."""
+        import requests
+
+        url = stash_base() + "/scene/" + scene_id + "/" + ("screenshot" if kind == "img" else "stream")
+        headers = {}
+        if STASH_API_KEY:
+            headers["ApiKey"] = STASH_API_KEY
+        rng = self.headers.get("Range")
+        if rng:
+            headers["Range"] = rng
+        try:
+            up = requests.get(url, headers=headers, stream=True, timeout=60)
+        except Exception as exc:  # noqa: BLE001
+            return self._send(502, {"error": "stash media: " + str(exc)})
+        self.send_response(up.status_code)
+        for h in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
+            if h in up.headers:
+                self.send_header(h, up.headers[h])
+        self._cors()
+        self.end_headers()
+        try:
+            for chunk in up.iter_content(65536):
+                if chunk:
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
 
     def do_GET(self):
         raw = self.path.split("?", 1)[0]
@@ -248,8 +338,15 @@ class Handler(BaseHTTPRequestHandler):
                 "backend": os.environ.get("BACKEND", "deepmosaics"),
                 "postUpscale": core.env_bool("POST_UPSCALE", False),
             })
+        # Media proxies for the dashboard's <img>/<video> (which can't send the
+        # token header) — left open; the worker sits behind your proxy's auth.
+        m = re.match(r"^/api/(img|vid)/(\d+)$", path)
+        if m:
+            return self.proxy_media(m.group(1), m.group(2))
         if not self._authed():
             return self._send(401, {"error": "bad token"})
+        if path == "/api/scenes":
+            return self.api_scenes()
         if path == "/api/jobs":
             with _jobs_lock:
                 data = [public(j) for j in _jobs.values()]

@@ -1,0 +1,63 @@
+name: Build & publish worker image
+
+# Builds the decensor worker image in the cloud (no local Docker needed) and
+# pushes it to GitHub Container Registry. Triggers:
+#   - pushing a version tag (v1.2.3)  -> tags 1.2.3, 1.2, latest, sha-xxxxxxx
+#   - manual run (Actions tab / gh)   -> tags latest, sha-xxxxxxx
+#
+# Deploy on unRAID by pulling instead of building:
+#   docker login ghcr.io -u nphil        # one-time (private package)
+#   # in docker-compose.yml: image: ghcr.io/nphil/stash-decensor:latest  (drop `build: .`)
+#   docker compose pull && docker compose up -d
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}   # nphil/stash-decensor
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata (tags/labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

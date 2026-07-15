@@ -13,6 +13,10 @@
 #   /mnt/user/Stuff                   -> /stuff2
 services:
   decensor:
+    # Local build (default). To deploy the prebuilt GHCR image instead, comment
+    # out `build: .` and set `image: ghcr.io/nphil/stash-decensor:latest`, then:
+    #   docker login ghcr.io -u nphil   # one-time (private package)
+    #   docker compose pull && docker compose up -d
     build: .
     image: stashy-decensor:latest
     container_name: stashy-decensor

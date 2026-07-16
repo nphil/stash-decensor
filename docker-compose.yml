@@ -54,7 +54,7 @@ services:
       - /mnt/user/Stuff:/stuff2                       # == Stash's /stuff2
       # Shared handoff with the compute runner. Deliberately OUTSIDE the Stash
       # libraries so half-written intermediates can never get scanned as scenes.
-      - /mnt/user/appdata/decensor/scratch:/scratch
+      - /mnt/user/appdata/stashify/scratch:/scratch
     restart: unless-stopped
 
   # Compute runner (Pascal cu126 build): Lada decensoring + SPAN upscaling +
@@ -83,8 +83,8 @@ services:
     volumes:
       - /mnt/user/Download/torrents/Stuff:/stuff:ro   # read inputs at the same paths
       - /mnt/user/Stuff:/stuff2:ro
-      - /mnt/user/appdata/decensor/scratch:/scratch   # write outputs here (worker reads them)
-      - /mnt/user/appdata/decensor/lada-models:/models  # persists Lada weights (~GB)
+      - /mnt/user/appdata/stashify/scratch:/scratch   # write outputs here (worker reads them)
+      - /mnt/user/appdata/stashify/lada-models:/models  # persists Lada weights (~GB)
     restart: unless-stopped
 
 # unRAID without the compose plugin? Equivalent docker run (fill in the secrets):
@@ -94,5 +94,5 @@ services:
 #     -e BACKEND=lada -e LADA_URL=http://<runner-host>:8711 -e LADA_TOKEN=<token> \
 #     -e OUTPUT_DIR=/stuff2/decensored \
 #     -v /mnt/user/Download/torrents/Stuff:/stuff -v /mnt/user/Stuff:/stuff2 \
-#     -v /mnt/user/appdata/decensor/scratch:/scratch \
+#     -v /mnt/user/appdata/stashify/scratch:/scratch \
 #     ghcr.io/nphil/stashify:latest

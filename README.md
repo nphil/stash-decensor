@@ -87,7 +87,7 @@ fill in the paths/secrets.
 
 ### Option B: docker compose
 
-1. Clone the repo (e.g. `git clone https://github.com/nphil/stashify /mnt/user/appdata/decensor`).
+1. Clone the repo (e.g. `git clone https://github.com/nphil/stashify /mnt/user/appdata/stashify`).
 2. Edit `docker-compose.yml`: set `STASH_URL`, put `STASH_API_KEY` and
    `WORKER_TOKEN` in a `.env` file next to it, and fix the volume mounts (see
    the gotcha below). The compose defines two services: `stashify` (worker,

@@ -79,26 +79,13 @@ DEFAULTS = {
     "outputDir": "",
     "importResult": True,
     "gpuId": 0,
-    # pipeline
-    "backend": "deepmosaics",       # deepmosaics | realesrgan | command
-    "postUpscale": False,           # run Real-ESRGAN after the backend
-    # DeepMosaics
-    "deepMosaicsDir": "",
-    "modelPath": "",
-    "mosaicPositionModelPath": "",   # mosaic_position.pth; "" -> next to modelPath
-    "pythonBin": "python",
-    "maskThreshold": 64,
-    # Real-ESRGAN
-    "realEsrganDir": "",
-    "realEsrganPython": "python",
-    "realEsrganModel": "realesr-animevideov3",
-    "realEsrganScale": 2,
-    "realEsrganFaceEnhance": False,
-    "realEsrganFp32": True,         # Pascal (Tesla P40) has awful fp16 -> keep fp32
-    "realEsrganTile": 0,            # >0 tiles to bound VRAM on big frames
+    # pipeline: all GPU work happens on a runner (lada_runner.py); the worker
+    # is a thin coordinator.  backend: lada | upscale | command
+    "backend": "lada",
+    "postUpscale": False,            # lada backend: chain decensor -> upscale on the runner
     # generic command backend
     "commandTemplate": "",
-    # Lada backend (separate GPU runner container; see lada_runner.py)
+    # Lada/compute runner (separate GPU container; see lada_runner.py)
     "ladaUrl": "",                   # e.g. http://stashy-lada:8711
     "ladaToken": "",
     "ladaScratch": "/scratch",       # shared mount both worker + runner see
@@ -106,7 +93,8 @@ DEFAULTS = {
     "ladaDetModel": "v4-fast",       # v4-fast | v4-accurate | v2
     "ladaFp16": False,               # Pascal P40: keep False (no usable fp16)
     "ladaDevice": "cuda",
-    "ladaEncoder": "",               # "" = lada default; e.g. hevc_nvenc for P40 NVENC
+    "ladaEncoder": "",               # "" = runner default (NVENC probe result)
+    "ladaUpscaleModel": "",          # "" = runner default (2xLiveActionV1_SPAN)
 }
 
 SCENE_FRAGMENT = """
@@ -140,19 +128,11 @@ def validate(cfg):
 
     backend = cfg["backend"]
     if backend not in BACKENDS:
-        problems.append(f"backend '{backend}' (use deepmosaics | realesrgan | lada | command)")
-    if backend == "deepmosaics":
-        if not str(cfg["deepMosaicsDir"]).strip():
-            problems.append("DeepMosaics Directory")
-        if not str(cfg["modelPath"]).strip():
-            problems.append("Clean Model Path")
-    if backend == "realesrgan" or (cfg["postUpscale"] and backend != "lada"):
-        if not str(cfg["realEsrganDir"]).strip():
-            problems.append("Real-ESRGAN Directory")
+        problems.append(f"backend '{backend}' (use lada | upscale | command)")
     if backend == "command" and not str(cfg["commandTemplate"]).strip():
         problems.append("Command Template")
-    if backend == "lada" and not str(cfg["ladaUrl"]).strip():
-        problems.append("Lada Runner URL (LADA_URL)")
+    if backend in ("lada", "upscale") and not str(cfg["ladaUrl"]).strip():
+        problems.append("Runner URL (LADA_URL)")
 
     if problems:
         message = "Missing/invalid config: " + ", ".join(problems)
@@ -335,73 +315,6 @@ def newest_video(result_dir):
 # backends: (cfg, input_path, result_dir) -> produced_video_path
 # --------------------------------------------------------------------------- #
 
-def backend_deepmosaics(cfg, input_path, result_dir, on_line=None, log_cb=None):
-    dm_dir = cfg["deepMosaicsDir"]
-    script = os.path.join(dm_dir, "deepmosaic.py")
-    if not os.path.isfile(script):
-        raise RuntimeError(f"deepmosaic.py not found at {script}")
-    # 'clean' mode needs the mosaic-position model too. Left at DeepMosaics'
-    # default ('auto') it looks for mosaic_position.pth beside the clean model
-    # and, if absent, calls input() -> EOFError in a headless container (hang/abort).
-    # Resolve it explicitly so a missing file fails loudly instead.
-    pos_model = str(cfg.get("mosaicPositionModelPath") or "").strip()
-    if not pos_model:
-        pos_model = os.path.join(os.path.dirname(cfg["modelPath"]), "mosaic_position.pth")
-    if not os.path.isfile(pos_model):
-        raise RuntimeError(
-            f"DeepMosaics position model not found at {pos_model}. It ships in the "
-            "DeepMosaics pretrained-models folder alongside clean_youknow_video.pth; "
-            "set MOSAIC_POSITION_MODEL_PATH or drop mosaic_position.pth into /models."
-        )
-    temp_dir = tempfile.mkdtemp(prefix="dm_tmp_")
-    set_live_preview(type="deepmosaics", temp_dir=temp_dir, input=input_path)
-    try:
-        run_cmd(
-            [
-                cfg["pythonBin"], script,
-                "--mode", "clean",
-                "--model_path", cfg["modelPath"],
-                "--mosaic_position_model_path", pos_model,
-                "--media_path", input_path,
-                "--result_dir", result_dir,
-                "--temp_dir", temp_dir,
-                "--gpu_id", str(_int(cfg["gpuId"])),
-                "--mask_threshold", str(_int(cfg["maskThreshold"], 64)),
-                "--no_preview",
-            ],
-            cwd=dm_dir, tag="deepmosaics", on_line=on_line, log_cb=log_cb,
-        )
-    finally:
-        clear_live_preview()
-        shutil.rmtree(temp_dir, ignore_errors=True)
-    return newest_video(result_dir)
-
-
-def backend_realesrgan(cfg, input_path, result_dir, on_line=None, log_cb=None):
-    re_dir = cfg["realEsrganDir"]
-    script = os.path.join(re_dir, "inference_realesrgan_video.py")
-    if not os.path.isfile(script):
-        raise RuntimeError(f"inference_realesrgan_video.py not found at {script}")
-    cmd = [
-        cfg["realEsrganPython"], script,
-        "-i", input_path,
-        "-o", result_dir,
-        "-n", str(cfg["realEsrganModel"]),
-        "-s", str(cfg["realEsrganScale"]),
-        "--suffix", "out",
-    ]
-    # Pascal cards (Tesla P40) are ~1/64 fp16 speed and can NaN in half; fp32 is
-    # both faster and correct there.
-    if cfg.get("realEsrganFp32", True):
-        cmd.append("--fp32")
-    if _int(cfg.get("realEsrganTile", 0)) > 0:
-        cmd += ["-t", str(_int(cfg["realEsrganTile"]))]
-    if cfg.get("realEsrganFaceEnhance"):
-        cmd.append("--face_enhance")
-    run_cmd(cmd, cwd=re_dir, env=cuda_env(cfg), tag="realesrgan", on_line=on_line, log_cb=log_cb)
-    return newest_video(result_dir)
-
-
 def backend_command(cfg, input_path, result_dir, on_line=None, log_cb=None):
     """Generic backend. Template placeholders (each must be its own token):
        {input}      absolute path to the source video
@@ -420,19 +333,20 @@ def backend_command(cfg, input_path, result_dir, on_line=None, log_cb=None):
     return newest_video(result_dir)
 
 
-def backend_lada(cfg, input_path, result_dir, on_line=None, log_cb=None):
-    """Dispatch to a separate Lada GPU runner (lada_runner.py) over HTTP.
+def _runner_dispatch(cfg, input_path, result_dir, op, on_line=None, log_cb=None):
+    """Dispatch a GPU job (decensor / upscale / chain) to the compute runner
+    (lada_runner.py) over HTTP.
 
-    The runner writes the restored file into a shared scratch dir (both
-    containers mount it at the same path); we tail its log — relaying each line
-    through on_line (so the existing frame/fps/progress parser drives the job's
-    stats) and log_cb (live-log) — then move the produced file into result_dir.
+    The runner writes its output into a shared scratch dir (both containers
+    mount it at the same path); we tail its log — relaying each line through
+    on_line (so the existing frame/fps/progress parser drives the job's stats)
+    and log_cb (live-log) — then move the produced file into result_dir.
     Cancel/pause/resume forward to the runner via the remote-control hooks."""
     import requests
 
     base = str(cfg.get("ladaUrl") or "").rstrip("/")
     if not base:
-        raise RuntimeError("Lada backend selected but LADA_URL is not set.")
+        raise RuntimeError("Runner backend selected but LADA_URL is not set.")
     token = str(cfg.get("ladaToken") or "")
     headers = {"Content-Type": "application/json"}
     if token:
@@ -443,6 +357,7 @@ def backend_lada(cfg, input_path, result_dir, on_line=None, log_cb=None):
     os.makedirs(sub, exist_ok=True)
 
     payload = {
+        "op": op,
         "input": input_path,
         "output_dir": sub,
         "restoration_model": cfg.get("ladaRestModel") or "basicvsrpp-v1.2",
@@ -450,6 +365,7 @@ def backend_lada(cfg, input_path, result_dir, on_line=None, log_cb=None):
         "fp16": bool(cfg.get("ladaFp16", False)),
         "device": cfg.get("ladaDevice") or "cuda",
         "encoder": cfg.get("ladaEncoder") or "",
+        "upscale_model": cfg.get("ladaUpscaleModel") or "",
     }
 
     def _post(action):
@@ -467,7 +383,7 @@ def backend_lada(cfg, input_path, result_dir, on_line=None, log_cb=None):
         shutil.rmtree(sub, ignore_errors=True)
         raise RuntimeError(f"Lada runner unreachable at {base}: {exc}")
 
-    log.info(f"Lada runner job {rid} on {base}")
+    log.info(f"Runner job {rid} ({op}) on {base}")
     set_remote_controls(cancel=lambda: _post("cancel"),
                         pause=lambda: _post("pause"),
                         resume=lambda: _post("resume"))
@@ -534,11 +450,19 @@ def backend_lada(cfg, input_path, result_dir, on_line=None, log_cb=None):
         shutil.rmtree(sub, ignore_errors=True)
 
 
+def backend_lada(cfg, input_path, result_dir, on_line=None, log_cb=None):
+    op = "decensor+upscale" if cfg.get("postUpscale") else "decensor"
+    return _runner_dispatch(cfg, input_path, result_dir, op, on_line=on_line, log_cb=log_cb)
+
+
+def backend_upscale(cfg, input_path, result_dir, on_line=None, log_cb=None):
+    return _runner_dispatch(cfg, input_path, result_dir, "upscale", on_line=on_line, log_cb=log_cb)
+
+
 BACKENDS = {
-    "deepmosaics": backend_deepmosaics,
-    "realesrgan": backend_realesrgan,
-    "command": backend_command,
     "lada": backend_lada,
+    "upscale": backend_upscale,
+    "command": backend_command,
 }
 
 
@@ -653,9 +577,6 @@ def process_scene(stash, cfg, scene, trigger_tag_id, done_tag_id):
 
     try:
         produced = BACKENDS[cfg["backend"]](cfg, input_path, new_dir())
-        if cfg["postUpscale"] and cfg["backend"] not in ("realesrgan", "lada"):
-            log.info("Post-processing with Real-ESRGAN upscale")
-            produced = backend_realesrgan(cfg, produced, new_dir())
 
         os.makedirs(cfg["outputDir"], exist_ok=True)
         stem = re.sub(r"\s+", "_", os.path.splitext(os.path.basename(input_path))[0])
@@ -770,7 +691,7 @@ def run(stash, cfg, mode="tagged", scene_ids=None):
         return 0
 
     total = len(scenes)
-    chain = " + Real-ESRGAN upscale" if cfg["postUpscale"] and cfg["backend"] not in ("realesrgan", "lada") else ""
+    chain = " + upscale" if cfg["postUpscale"] and cfg["backend"] == "lada" else ""
     log.info(f"Processing {total} scene(s) with backend '{cfg['backend']}'{chain}.")
     succeeded = 0
     for index, scene in enumerate(scenes):
@@ -799,16 +720,6 @@ _ENV_MAP = {
     "outputDir": "OUTPUT_DIR",
     "gpuId": "GPU_ID",
     "backend": "BACKEND",
-    "deepMosaicsDir": "DEEPMOSAICS_DIR",
-    "modelPath": "MODEL_PATH",
-    "mosaicPositionModelPath": "MOSAIC_POSITION_MODEL_PATH",
-    "pythonBin": "PYTHON_BIN",
-    "maskThreshold": "MASK_THRESHOLD",
-    "realEsrganDir": "REALESRGAN_DIR",
-    "realEsrganPython": "REALESRGAN_PYTHON",
-    "realEsrganModel": "REALESRGAN_MODEL",
-    "realEsrganScale": "REALESRGAN_SCALE",
-    "realEsrganTile": "REALESRGAN_TILE",
     "commandTemplate": "COMMAND_TEMPLATE",
     "ladaUrl": "LADA_URL",
     "ladaToken": "LADA_TOKEN",
@@ -817,12 +728,11 @@ _ENV_MAP = {
     "ladaDetModel": "LADA_DETECTION_MODEL",
     "ladaDevice": "LADA_DEVICE",
     "ladaEncoder": "LADA_ENCODER",
+    "ladaUpscaleModel": "LADA_UPSCALE_MODEL",
 }
 _ENV_BOOL = {
     "postUpscale": "POST_UPSCALE",
     "importResult": "IMPORT_RESULT",
-    "realEsrganFp32": "REALESRGAN_FP32",
-    "realEsrganFaceEnhance": "REALESRGAN_FACE_ENHANCE",
     "ladaFp16": "LADA_FP16",
 }
 
@@ -943,16 +853,9 @@ def process_to_review(stash, cfg, scene_id, progress=None, log_cb=None):
 
     try:
         backend = cfg["backend"]
-        upscale = cfg["postUpscale"] and backend not in ("realesrgan", "lada")
-        b_lo, b_hi = (0.05, 0.6) if upscale else (0.05, 0.85)
-
-        p(b_lo, f"Running {backend}", {"stage": backend})
+        p(0.05, f"Running {backend}", {"stage": backend})
         produced = BACKENDS[backend](cfg, input_path, new_dir(),
-                                     on_line=_band(progress, b_lo, b_hi, backend), log_cb=log_cb)
-        if upscale:
-            p(0.6, "Real-ESRGAN upscale", {"stage": "realesrgan"})
-            produced = backend_realesrgan(cfg, produced, new_dir(),
-                                          on_line=_band(progress, 0.6, 0.85, "realesrgan"), log_cb=log_cb)
+                                     on_line=_band(progress, 0.05, 0.85, backend), log_cb=log_cb)
 
         p(0.88, "Importing preview into Stash", {"stage": "import"})
         os.makedirs(cfg["outputDir"], exist_ok=True)

@@ -26,6 +26,8 @@ fetch() {  # url filename
 fetch "$HF/lada_mosaic_detection_model_v4_fast.pt"                 lada_mosaic_detection_model_v4_fast.pt
 fetch "$HF/lada_mosaic_detection_model_v4_accurate.pt"            lada_mosaic_detection_model_v4_accurate.pt
 fetch "$HF/lada_mosaic_restoration_model_generic_v1.2.pth"       lada_mosaic_restoration_model_generic_v1.2.pth
+# upscale model: SPAN trained specifically on live-action video degradations (8.5 MB)
+fetch "https://raw.githubusercontent.com/jcj83429/upscaling/f73a3a02874360ec6ced18f8bdd8e43b5d7bba57/2xLiveActionV1_SPAN/2xLiveActionV1_SPAN_490000.pth" 2xLiveActionV1_SPAN_490000.pth
 
 VENVPY=/opt/lada/.venv/bin/python
 

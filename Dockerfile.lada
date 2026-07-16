@@ -52,7 +52,11 @@ RUN uv sync --extra nvidia-legacy
 RUN pip download av==16.1.0 --only-binary=:all: --no-deps -d /opt/wheels/modern \
     && pip wheel --no-binary av --no-deps av==16.1.0 -w /opt/wheels/legacy
 
+# spandrel loads SR checkpoints (SPAN/Compact/ESRGAN…) for the upscale op
+RUN uv pip install spandrel
+
 COPY lada_runner.py /opt/lada/lada_runner.py
+COPY upscale_cli.py /opt/lada/upscale_cli.py
 COPY lada_entrypoint.sh /usr/local/bin/lada_entrypoint.sh
 # normalize line endings (file may transit a Windows checkout) + make executable
 RUN sed -i 's/\r$//' /usr/local/bin/lada_entrypoint.sh && chmod +x /usr/local/bin/lada_entrypoint.sh

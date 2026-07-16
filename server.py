@@ -101,15 +101,12 @@ def stash_gql(query, variables=None):
 
 # Per-request overrides the UI may send -> cfg keys.
 OVERRIDES = {
-    "backend": "backend",
-    "post_upscale": "postUpscale",
-    "realesrgan_model": "realEsrganModel",
-    "realesrgan_scale": "realEsrganScale",
-    "mask_threshold": "maskThreshold",
+    "backend": "backend",                  # lada | upscale | command
+    "post_upscale": "postUpscale",         # lada: chain decensor -> upscale on the runner
     "gpu_id": "gpuId",
-    "face_enhance": "realEsrganFaceEnhance",
-    "detection_model": "ladaDetModel",     # Lada: v4-fast | v4-accurate | v2
+    "detection_model": "ladaDetModel",     # v4-fast | v4-accurate | v2
     "restoration_model": "ladaRestModel",
+    "upscale_model": "ladaUpscaleModel",
 }
 
 _jobs = {}
@@ -225,6 +222,21 @@ def _numf(s):
 
 
 def _read_gpu():
+    """GPU telemetry. The slim worker has no GPU — the compute runner owns it,
+    so ask the runner's /gpu endpoint; fall back to local nvidia-smi for
+    deployments that still run the worker on the GPU host."""
+    lada = os.environ.get("LADA_URL", "").rstrip("/")
+    if lada:
+        try:
+            import requests
+
+            r = requests.get(lada + "/gpu", timeout=5)
+            if r.ok:
+                data = r.json()
+                if data:
+                    return data
+        except Exception:  # noqa: BLE001
+            pass
     gid = os.environ.get("GPU_ID", "0")
     if str(gid).strip() in ("", "-1"):
         return {}
@@ -241,7 +253,7 @@ def _read_gpu():
             return {}
         return {"util": _numf(v[0]), "mem_used": _numf(v[1]), "mem_total": _numf(v[2]),
                 "temp": _numf(v[3]), "power": _numf(v[4])}
-    except Exception:  # noqa: BLE001
+    except (Exception, FileNotFoundError):  # noqa: BLE001
         return {}
 
 
@@ -264,31 +276,6 @@ def gpu_poller():
 # --------------------------------------------------------------------------- #
 
 PREVIEW_DIR = os.environ.get("PREVIEW_DIR", "/tmp/decensor_preview")
-_IMG_EXTS = (".jpg", ".jpeg", ".png")
-
-
-def _ff(args, timeout=20):
-    """Run ffmpeg/ffprobe quietly; True on success."""
-    try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-        return r.returncode == 0, r.stdout.strip()
-    except Exception:  # noqa: BLE001
-        return False, ""
-
-
-def _jpeg(src_args, dest, scale="scale=480:-2"):
-    """Extract one frame -> dest (atomic via tmp+replace)."""
-    tmp = dest + ".tmp.jpg"
-    ok, _ = _ff(["ffmpeg", "-y", "-loglevel", "error"] + src_args +
-                ["-frames:v", "1", "-vf", scale, "-q:v", "4", tmp])
-    if ok and os.path.getsize(tmp) > 0:
-        os.replace(tmp, dest)
-        return True
-    try:
-        os.remove(tmp)
-    except OSError:
-        pass
-    return False
 
 
 def _preview_lada(info, dest_dir):
@@ -311,35 +298,8 @@ def _preview_lada(info, dest_dir):
         os.replace(tmp, os.path.join(dest_dir, which + ".jpg"))
 
 
-def _preview_deepmosaics(info, dest_dir):
-    """Newest processed frame image in the temp dir; the matching original is the
-    same-named file in a sibling subdir (DeepMosaics keeps both stages on disk)."""
-    temp = info["temp_dir"]
-    newest, newest_m = None, 0
-    for root, _dirs, files in os.walk(temp):
-        for f in files:
-            if f.lower().endswith(_IMG_EXTS):
-                p = os.path.join(root, f)
-                try:
-                    m = os.path.getmtime(p)
-                except OSError:
-                    continue
-                if m > newest_m:
-                    newest, newest_m = p, m
-    if not newest or time.time() - newest_m < 0.5:   # skip a file mid-write
-        return
-    if not _jpeg(["-i", newest], os.path.join(dest_dir, "after.jpg")):
-        return
-    base = os.path.basename(newest)
-    ndir = os.path.dirname(newest)
-    for root, _dirs, files in os.walk(temp):         # same name, different stage dir
-        if root != ndir and base in files:
-            _jpeg(["-i", os.path.join(root, base)], os.path.join(dest_dir, "before.jpg"))
-            return
-
-
 def preview_poller():
-    extractors = {"lada": _preview_lada, "deepmosaics": _preview_deepmosaics}
+    extractors = {"lada": _preview_lada}
     while True:
         time.sleep(2)
         with _jobs_lock:
@@ -664,7 +624,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {
                 "ok": True,
                 "gpu": os.environ.get("GPU_ID", "0"),
-                "backend": os.environ.get("BACKEND", "deepmosaics"),
+                "backend": os.environ.get("BACKEND", "lada"),
                 "postUpscale": core.env_bool("POST_UPSCALE", False),
                 "lada": bool(os.environ.get("LADA_URL", "").strip()),
                 "gpu_stats": gpu_stats,

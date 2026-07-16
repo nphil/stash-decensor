@@ -71,10 +71,10 @@
     } catch (e) { /* worker may accept unauthenticated */ }
   }
   var health = null;
+  var ENGINE_LABEL = { "lada": "lada", "lada+up": "lada + upscale", "upscale": "upscale 2x" };
   function connLabel() {
     // reflect the SELECTED engine, not the worker's env default
-    if ($("engine").value === "lada") return "lada (temporal)";
-    return (health ? health.backend : "?") + (health && health.postUpscale ? " + upscale" : "");
+    return ENGINE_LABEL[$("engine").value] || (health ? health.backend : "?");
   }
   function renderConn() {
     if (!health) return;
@@ -84,11 +84,8 @@
   async function updateConn() {
     try {
       health = await workerFetch("health");
-      var opt = document.querySelector('#engine option[value="lada"]');
-      if (opt) {
-        opt.disabled = !health.lada;
-        opt.textContent = health.lada ? "Lada (temporal)" : "Lada (offline)";
-      }
+      $("engine").disabled = !health.lada;      // every engine runs on the runner
+      $("engine").title = health.lada ? "Engine" : "compute runner offline";
       renderConn();
     } catch (e) {
       conn.className = "conn err"; conn.textContent = "worker unreachable";
@@ -165,14 +162,19 @@
     refreshSelBtn();
   }
   function refreshSelBtn() {
-    var b = $("decensorSel"); b.textContent = "Decensor selected (" + state.sel.size + ")"; b.disabled = state.sel.size === 0;
+    var b = $("decensorSel");
+    var verb = $("engine").value === "upscale" ? "Upscale" : "Decensor";
+    b.textContent = verb + " selected (" + state.sel.size + ")";
+    b.disabled = state.sel.size === 0;
   }
 
   async function decensorSelected() {
     var ids = Array.from(state.sel);
     if (!ids.length) return;
-    var extra = {};
-    if ($("engine").value === "lada") { extra.backend = "lada"; extra.detection_model = $("ladaq").value; }
+    var eng = $("engine").value;
+    var extra = { backend: eng === "upscale" ? "upscale" : "lada" };
+    if (eng !== "upscale") extra.detection_model = $("ladaq").value;
+    if (eng === "lada+up") extra.post_upscale = true;
     var ok = 0;
     for (var i = 0; i < ids.length; i++) {
       try {
@@ -399,7 +401,8 @@
       // written) next to the CENSORED ORIGINAL, seek-locked to its playhead.
       var duo = el("div", "duo");
       duo.hidden = true;
-      var mkv = function (label, live) {
+      var caps = {};
+      var mkv = function (key, label, live) {
         var f = el("figure");
         var v = el("video");
         v.muted = true; v.playsInline = true;
@@ -411,10 +414,12 @@
         cap.title = "toggle large view";
         f.appendChild(cap);
         duo.appendChild(f);
+        caps[key] = cap;
         return v;
       };
-      var cens = mkv("Censored (original)", false);
-      var lv = mkv("Decensored · live", true);
+      var cens = mkv("cens", "Censored (original)", false);
+      var lv = mkv("live", "Decensored · live", true);
+      c._refs.capCens = caps.cens; c._refs.capLive = caps.live;
       lv.addEventListener("loadeddata", function () { duo.hidden = false; });
       // The original PLAYS alongside the live feed (smooth), paired to its
       // play/pause/seek and drift-corrected only when >1s out of step —
@@ -482,8 +487,8 @@
     r.bar.className = "bar" + (j.paused ? " is-paused" : "");
     r.fill.style.width = pct + "%";
     if (r.stats) fillStats(r.stats, j, pct);
-    if (r.pv && j.preview && j.backend !== "lada") {
-      // still-frame pair (DeepMosaics): lada gets the synced video duo instead
+    if (r.pv && j.preview && j.backend !== "lada" && j.backend !== "upscale") {
+      // still-frame pair (legacy/command backends): runner ops use the video duo
       var now = Date.now();
       if (now - r.pv._last > 2000) {          // refresh pace ~ the extractor's
         r.pv._last = now;
@@ -496,7 +501,12 @@
         });
       }
     }
-    if (r.live && j.backend === "lada" && j.preview && !r.live.src) {
+    if (r.capCens && j.backend) {
+      var up = j.backend === "upscale";
+      r.capCens.textContent = up ? "Original" : "Censored (original)";
+      r.capLive.textContent = up ? "Upscaled · live" : "Decensored · live";
+    }
+    if (r.live && (j.backend === "lada" || j.backend === "upscale") && j.preview && !r.live.src) {
       // attach once, after the first fragments exist (preview implies output);
       // 'loadeddata' on the live feed unhides the whole duo
       r.live.src = workerUrl("jobs/" + j.id + "/live.mp4");
@@ -537,17 +547,21 @@
     var deb;
     $("search").addEventListener("input", function () { clearTimeout(deb); deb = setTimeout(function () { state.page = 1; loadScenes(); }, 300); });
     $("sort").onchange = $("minres").onchange = $("hideDone").onchange = function () { state.page = 1; loadScenes(); };
-    // engine choice persists across visits
+    // engine choice persists across visits ("" was the old DeepMosaics default)
     try {
       var se = localStorage.getItem("dc_engine"), sq = localStorage.getItem("dc_ladaq");
-      if (se) $("engine").value = se;
+      if (se && ENGINE_LABEL[se]) $("engine").value = se;
       if (sq) $("ladaq").value = sq;
     } catch (e) {}
-    $("ladaq").hidden = $("engine").value !== "lada";
-    $("engine").onchange = function () {
-      $("ladaq").hidden = $("engine").value !== "lada";
-      try { localStorage.setItem("dc_engine", $("engine").value); } catch (e) {}
+    var syncEngine = function () {
+      $("ladaq").hidden = $("engine").value === "upscale";   // detect model is decensor-only
+      refreshSelBtn();
       renderConn();
+    };
+    syncEngine();
+    $("engine").onchange = function () {
+      syncEngine();
+      try { localStorage.setItem("dc_engine", $("engine").value); } catch (e) {}
     };
     $("ladaq").onchange = function () {
       try { localStorage.setItem("dc_ladaq", $("ladaq").value); } catch (e) {}

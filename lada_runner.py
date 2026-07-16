@@ -31,6 +31,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LADA_CLI = os.environ.get("LADA_CLI", "/opt/lada/.venv/bin/lada-cli")
 LADA_DIR = os.environ.get("LADA_DIR", "/opt/lada")
+VENV_PY = os.environ.get("LADA_VENV_PY", "/opt/lada/.venv/bin/python")
+UPSCALE_SCRIPT = os.environ.get("UPSCALE_SCRIPT", "/opt/lada/upscale_cli.py")
 MODELS_DIR = os.environ.get("LADA_MODEL_WEIGHTS_DIR", "/models")
 TOKEN = os.environ.get("LADA_TOKEN", "")
 PORT = int(os.environ.get("PORT", "8711"))
@@ -147,6 +149,8 @@ def _newest_video(d):
 
 def _stage_of(line):
     low = line.lower()
+    if "upscal" in low:
+        return "upscale"
     if "detect" in low:
         return "detection"
     if "restor" in low or "export" in low or "encod" in low or "clip" in low:
@@ -242,37 +246,63 @@ def preview_path(jid, which):
     return p if os.path.isfile(p) else None
 
 
-def run_job(job):
-    jid = job["id"]
-    o = job["_opts"]
-    out_dir = o["output_dir"]
-    os.makedirs(out_dir, exist_ok=True)
-    # Encoder priority: per-job override > LADA_DEFAULT_ENCODER (set by the
-    # entrypoint's NVENC probe: hevc_nvenc when the GPU/driver can open it,
-    # libx264 otherwise) > libx264.
-    encoder = o.get("encoder") or os.environ.get("LADA_DEFAULT_ENCODER", "libx264")
-    argv = [
+def read_gpu():
+    """GPU telemetry via the runtime-injected nvidia-smi. The (GPU-less) worker
+    polls this to show live stats in the dashboard."""
+    gid = os.environ.get("GPU_ID", "0")
+    if str(gid).strip() in ("", "-1"):
+        return {}
+    try:
+        q = "utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw"
+        out = subprocess.run(
+            ["nvidia-smi", "-i", str(gid), "--query-gpu=" + q, "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5)
+        if out.returncode != 0 or not out.stdout.strip():
+            return {}
+        vals = [x.strip() for x in out.stdout.strip().splitlines()[0].split(",")]
+        if len(vals) < 5:
+            return {}
+
+        def numf(s):
+            try:
+                return float(s)
+            except (ValueError, TypeError):
+                return None
+        return {"util": numf(vals[0]), "mem_used": numf(vals[1]), "mem_total": numf(vals[2]),
+                "temp": numf(vals[3]), "power": numf(vals[4])}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _lada_argv(o, input_path, out_dir, encoder):
+    return [
         LADA_CLI,
-        "--input", o["input"],
+        "--input", input_path,
         "--output", out_dir,
         "--device", o.get("device") or "cuda",
         ("--fp16" if o.get("fp16") else "--no-fp16"),
         "--mosaic-restoration-model", o.get("restoration_model") or "basicvsrpp-v1.2",
         "--mosaic-detection-model", o.get("detection_model") or "v4-fast",
         "--encoder", encoder,
-        "--mp4-fast-start",              # fragmented mp4: the growing file is decodable
+        "--mp4-fast-start",                # fragmented mp4: the growing file is decodable
         "--temporary-directory", out_dir,  # keep the in-progress file on the shared mount
-                                           # (default /tmp would hide it from live preview/feed)
     ]
 
-    set_job(jid, state="running", message="Starting lada-cli", started_at=time.time())
-    push_log(jid, "$ " + " ".join(argv), "event")
-    with _active_lock:
-        _active["cancel"] = False
-    stop_preview = threading.Event()
-    threading.Thread(target=_preview_loop, args=(jid, out_dir, o["input"], stop_preview),
-                     daemon=True).start()
 
+def _upscale_argv(o, input_path, out_dir, encoder):
+    argv = [VENV_PY, UPSCALE_SCRIPT, "--input", input_path,
+            "--output-dir", out_dir, "--encoder", encoder,
+            "--device", o.get("device") or "cuda"]
+    if o.get("upscale_model"):
+        argv += ["--model", o["upscale_model"]]
+    return argv
+
+
+def _run_phase(jid, argv, phase_idx, n_phases):
+    """Run one tool subprocess, streaming progress into the job. Progress is
+    mapped into the phase's slice of [0,1] so a decensor+upscale chain doesn't
+    jump backwards. Returns (returncode, cancelled)."""
+    push_log(jid, "$ " + " ".join(argv), "event")
     env = os.environ.copy()
     env["LADA_MODEL_WEIGHTS_DIR"] = MODELS_DIR
     kw = {"cwd": LADA_DIR, "env": env, "stdout": subprocess.PIPE,
@@ -281,11 +311,9 @@ def run_job(job):
         kw["start_new_session"] = True
     try:
         proc = subprocess.Popen(argv, **kw)
-    except FileNotFoundError:
-        set_job(jid, state="error", message="lada-cli not found", error="lada-cli not found",
-                _ended_at=time.time())
-        push_log(jid, "ERROR: lada-cli not found at " + LADA_CLI, "error")
-        return
+    except FileNotFoundError as exc:
+        push_log(jid, "ERROR: " + str(exc), "error")
+        return 127, False
     with _active_lock:
         _active["proc"] = proc
 
@@ -303,9 +331,9 @@ def run_job(job):
             pm = _RE_PCT.search(line)
             if pm:
                 pct = min(100, int(pm.group(1))) / 100.0
-                fields["progress"] = round(pct, 3)
+                fields["progress"] = round((phase_idx + pct) / n_phases, 3)
             lf = _RE_LADA_FRAME.search(line)
-            if lf:                                   # lada: "(84f)" done-frames
+            if lf:                                   # "(84f)" done-frames
                 fr = int(lf.group(1))
                 fields["frame"] = fr
                 if pct and pct > 0.01:               # estimate total from pct
@@ -316,7 +344,7 @@ def run_job(job):
                     fr, tot = int(m.group(1)), int(m.group(2))
                     fields["frame"] = fr
                     fields["total_frames"] = tot
-                    fields["progress"] = round(min(1.0, fr / tot), 3)
+                    fields["progress"] = round((phase_idx + min(1.0, fr / tot)) / n_phases, 3)
             fp = _RE_FPS.search(line)
             if fp:
                 try:
@@ -331,29 +359,68 @@ def run_job(job):
                 set_job(jid, **fields)
         proc.wait()
     finally:
-        stop_preview.set()
         with _active_lock:
-            proc_cancel = _active["cancel"]
+            cancelled = _active["cancel"]
             _active["proc"] = None
+    return proc.returncode, cancelled
 
-    if proc_cancel or proc.returncode is None:
-        set_job(jid, state="cancelled", message="Cancelled", _ended_at=time.time())
-        push_log(jid, "Cancelled", "warn")
-        return
-    if proc.returncode != 0:
-        set_job(jid, state="error", message="lada-cli exited %s" % proc.returncode,
-                error="lada-cli exited %s" % proc.returncode, _ended_at=time.time())
-        push_log(jid, "ERROR: lada-cli exited %s" % proc.returncode, "error")
-        return
-    produced = _newest_video(out_dir)
-    if not produced:
-        set_job(jid, state="error", message="no output produced", error="no output produced",
+
+def run_job(job):
+    jid = job["id"]
+    o = job["_opts"]
+    out_dir = o["output_dir"]
+    os.makedirs(out_dir, exist_ok=True)
+    op = o.get("op") or "decensor"
+    # Encoder priority: per-job override > LADA_DEFAULT_ENCODER (set by the
+    # entrypoint's NVENC probe) > libx264.
+    encoder = o.get("encoder") or os.environ.get("LADA_DEFAULT_ENCODER", "libx264")
+
+    set_job(jid, state="running", message="Starting " + op, started_at=time.time())
+    with _active_lock:
+        _active["cancel"] = False
+    stop_preview = threading.Event()
+    threading.Thread(target=_preview_loop, args=(jid, out_dir, o["input"], stop_preview),
+                     daemon=True).start()
+
+    # Phase plan. For the chain, phase 2 consumes phase 1's newest output.
+    phases = []                       # list of (name, argv_builder)
+    if op in ("decensor", "decensor+upscale"):
+        phases.append(("lada", _lada_argv))
+    if op in ("upscale", "decensor+upscale"):
+        phases.append(("upscale", _upscale_argv))
+    if not phases:
+        set_job(jid, state="error", message="unknown op " + op, error="unknown op " + op,
                 _ended_at=time.time())
-        push_log(jid, "ERROR: lada produced no video in " + out_dir, "error")
         return
-    set_job(jid, state="done", progress=1.0, message="Done", output_path=produced,
+
+    try:
+        current_input = o["input"]
+        for idx, (name, build) in enumerate(phases):
+            set_job(jid, message="Running " + name)
+            rc, cancelled = _run_phase(jid, build(o, current_input, out_dir, encoder),
+                                       idx, len(phases))
+            if cancelled or rc is None:
+                set_job(jid, state="cancelled", message="Cancelled", _ended_at=time.time())
+                push_log(jid, "Cancelled", "warn")
+                return
+            if rc != 0:
+                msg = "%s exited %s" % (name, rc)
+                set_job(jid, state="error", message=msg, error=msg, _ended_at=time.time())
+                push_log(jid, "ERROR: " + msg, "error")
+                return
+            nxt = _newest_video(out_dir)
+            if not nxt:
+                msg = "%s produced no video" % name
+                set_job(jid, state="error", message=msg, error=msg, _ended_at=time.time())
+                push_log(jid, "ERROR: " + msg, "error")
+                return
+            current_input = nxt
+    finally:
+        stop_preview.set()
+
+    set_job(jid, state="done", progress=1.0, message="Done", output_path=current_input,
             _ended_at=time.time())
-    push_log(jid, "Done -> " + produced, "event")
+    push_log(jid, "Done -> " + current_input, "event")
 
 
 def worker_loop():
@@ -414,7 +481,10 @@ class Handler(BaseHTTPRequestHandler):
             with _jobs_lock:
                 busy = _running_id is not None
             return self._send(200, {"ok": True, "device": os.environ.get("LADA_DEVICE", "cuda"),
-                                    "models": models, "busy": busy})
+                                    "models": models, "busy": busy,
+                                    "ops": ["decensor", "upscale", "decensor+upscale"]})
+        if raw == "/gpu":
+            return self._send(200, read_gpu())
         m = re.match(r"^/jobs/([0-9a-f]+)/preview/(before|after)\.jpg$", raw)
         if m:
             p = preview_path(m.group(1), m.group(2))

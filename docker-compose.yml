@@ -24,13 +24,11 @@ services:
       # unRAID Docker tab reads these: container icon + a WebUI link.
       net.unraid.docker.icon: "https://raw.githubusercontent.com/nphil/stash-decensor/main/assets/icon-256.png"
       net.unraid.docker.webui: "https://decensor.nateshome.net/"
-    runtime: nvidia          # unRAID Docker tab: also add "--runtime=nvidia" in Extra Parameters
+    # Thin coordinator: NO GPU, no CUDA, no models — all compute happens in the
+    # `lada` runner service below.
     ports:
       - "8710:8710"          # the on-demand HTTP API the Stash UI button calls
     environment:
-      NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
-
       # --- mode ---
       RUN_MODE: "server"                 # server = on-demand UI button (default); worker = tag batch
       PORT: "8710"
@@ -40,18 +38,8 @@ services:
       STASH_URL: "http://192.168.1.69:6969"   # Stash on BeastNAS (host port 6969 -> container 9999)
       STASH_API_KEY: "${STASH_API_KEY:-}"     # from .env (Stash auth is enabled)
 
-      # --- pipeline (defaults tuned for the Tesla P40) ---
-      BACKEND: "deepmosaics"             # deepmosaics | realesrgan | command
-      POST_UPSCALE: "true"               # DeepMosaics -> Real-ESRGAN (best quality)
-      REALESRGAN_MODEL: "realesr-animevideov3"
-      REALESRGAN_SCALE: "2"
-      REALESRGAN_FP32: "true"            # Tesla P40: KEEP true (Pascal fp16 is ~1/64 speed)
-      REALESRGAN_TILE: "0"               # set e.g. 512 if you OOM on 4K
-      GPU_ID: "0"
-
-      # --- Lada backend (optional higher-quality engine on a separate runner) ---
-      # Pick backend=lada per job from the dashboard; the worker dispatches to
-      # the `lada` service below and reads the result back off /scratch.
+      # --- pipeline: dispatched to the compute runner ---
+      BACKEND: "lada"                    # lada | upscale | command
       LADA_URL: "http://lada:8711"
       LADA_TOKEN: "${WORKER_TOKEN:-}"
       LADA_SCRATCH: "/scratch"
@@ -61,14 +49,13 @@ services:
     volumes:
       - /mnt/user/Download/torrents/Stuff:/stuff     # == Stash's /stuff
       - /mnt/user/Stuff:/stuff2                       # == Stash's /stuff2
-      - /mnt/user/appdata/decensor/models:/models     # persists the DeepMosaics .pth weights
-      # Shared handoff with the Lada runner. Deliberately OUTSIDE the Stash
+      # Shared handoff with the compute runner. Deliberately OUTSIDE the Stash
       # libraries so half-written intermediates can never get scanned as scenes.
       - /mnt/user/appdata/decensor/scratch:/scratch
     restart: unless-stopped
 
-  # Lada compute node (Pascal cu126 build). Its own container so the worker image
-  # stays lean; this is the first "runner" of the coordinator/runner design.
+  # Compute runner (Pascal cu126 build): Lada decensoring + SPAN upscaling +
+  # GPU telemetry. The first "runner" of the coordinator/runner design.
   lada:
     build:
       context: .
@@ -94,10 +81,10 @@ services:
 
 # unRAID without the compose plugin? Equivalent docker run (fill in the secrets):
 #
-#   docker run -d --name stashy-decensor --runtime=nvidia -p 8710:8710 \
-#     -e NVIDIA_VISIBLE_DEVICES=all -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
+#   docker run -d --name stashy-decensor -p 8710:8710 \
 #     -e STASH_URL=http://192.168.1.69:6969 -e STASH_API_KEY=<key> -e WORKER_TOKEN=<token> \
-#     -e POST_UPSCALE=true -e REALESRGAN_FP32=true -e OUTPUT_DIR=/stuff2/decensored \
+#     -e BACKEND=lada -e LADA_URL=http://<runner-host>:8711 -e LADA_TOKEN=<token> \
+#     -e OUTPUT_DIR=/stuff2/decensored \
 #     -v /mnt/user/Download/torrents/Stuff:/stuff -v /mnt/user/Stuff:/stuff2 \
-#     -v /mnt/user/appdata/decensor/models:/models \
+#     -v /mnt/user/appdata/decensor/scratch:/scratch \
 #     stashy-decensor:latest

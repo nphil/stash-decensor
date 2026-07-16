@@ -57,21 +57,10 @@ SCENES_GQL = (
     " studio { name } tags { name } } } }"
 )
 
-_done_tag_ids = None      # ids of tags named Decensored* (cached; for hide_done)
-
-
-def done_tag_ids():
-    """Tags to exclude when the dashboard hides decensored scenes. Filtering in
-    the GraphQL query keeps every page full (client-side filtering left holes)."""
-    global _done_tag_ids
-    if _done_tag_ids is None:
-        try:
-            data = stash_gql("query{ allTags { id name } }")
-            _done_tag_ids = [t["id"] for t in data.get("allTags", [])
-                             if t.get("name", "").lower().startswith("decensored")]
-        except Exception:  # noqa: BLE001 - fall back to client-side filtering
-            return []
-    return _done_tag_ids
+TAGS_GQL = (
+    "query($f: FindFilterType){ findTags(filter:$f){"
+    " tags { id name scene_count } } }"
+)
 
 
 def stash_base():
@@ -574,10 +563,9 @@ class Handler(BaseHTTPRequestHandler):
             "direction": (g("dir", "") or ("ASC" if sort == "title" else "DESC")).upper(),
         }
         sf = {}
-        if g("hide_done", "") in ("1", "true"):
-            ids = done_tag_ids()
-            if ids:
-                sf["tags"] = {"value": ids, "modifier": "EXCLUDES", "depth": 0}
+        want_tag = g("tag", "").strip()          # live tag filter from the dashboard
+        if want_tag:
+            sf["tags"] = {"value": [want_tag], "modifier": "INCLUDES_ALL", "depth": 0}
         try:
             data = stash_gql(SCENES_GQL, {"f": f, "sf": sf or None})
             return self._send(200, data["findScenes"])
@@ -690,6 +678,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(401, {"error": "bad token"})
         if path == "/api/scenes":
             return self.api_scenes()
+        if path == "/api/tags":
+            # live tag list from Stash for the dashboard filter (busiest first)
+            try:
+                data = stash_gql(TAGS_GQL, {"f": {"per_page": 500, "sort": "scenes_count",
+                                                  "direction": "DESC"}})
+                tags = [t for t in data["findTags"]["tags"] if (t.get("scene_count") or 0) > 0]
+                return self._send(200, tags)
+            except Exception as exc:  # noqa: BLE001
+                return self._send(502, {"error": "stash: " + str(exc)})
         if path == "/api/jobs":
             with _jobs_lock:
                 data = [public(j) for j in _jobs.values()]

@@ -780,7 +780,18 @@ def stash_from_env():
 # on-demand: decensor one scene -> reviewable preview -> replace / discard
 # --------------------------------------------------------------------------- #
 
-PREVIEW_TAG = "Decensored (preview)"
+PREVIEW_TAG = "Decensored (preview)"   # legacy name; preview tag is op-aware now
+
+
+def op_tag_names(cfg):
+    """Tags describing what was done to the scene: Decensored, Upscaled, or both
+    (lada + postUpscale chain). Applied to the original on replace."""
+    if cfg["backend"] == "upscale":
+        return ["Upscaled"]
+    tags = [str(cfg.get("doneTag") or "Decensored")]
+    if cfg.get("postUpscale"):
+        tags.append("Upscaled")
+    return tags
 
 
 _RE_FRAMES = re.compile(r"(\d+)\s*/\s*(\d+)\s*\[")  # tqdm "27/60 [..]" — avoids stray ratios
@@ -873,11 +884,11 @@ def process_to_review(stash, cfg, scene_id, progress=None, log_cb=None):
             f={"path": {"value": dest, "modifier": "EQUALS"}}, fragment="id"
         )
         review_id = matches[0]["id"] if matches else None
+        label = "Upscaled" if cfg["backend"] == "upscale" else "Decensored"
         if review_id:
-            preview_tag = stash.find_tag(PREVIEW_TAG, create=True)
+            preview_tag = stash.find_tag(f"{label} (preview)", create=True)
             update = {"id": review_id, "tag_ids": [preview_tag["id"]]}
             if scene.get("title"):
-                label = "Upscaled" if cfg["backend"] == "upscale" else "Decensored"
                 update["title"] = f"{scene['title']} ({label} preview)"
             stash.update_scene(update)
         else:
@@ -892,6 +903,7 @@ def process_to_review(stash, cfg, scene_id, progress=None, log_cb=None):
             "orig_path": input_path,
             "output_path": dest,
             "review_scene_id": review_id,
+            "op_tags": op_tag_names(cfg),   # applied to the original on replace
         }
     finally:
         for d in stage_dirs:
@@ -945,16 +957,20 @@ def replace_original(stash, cfg, info, progress=None):
     # Clear the now-moved preview file from the output library.
     scan_and_wait(stash, cfg["outputDir"])
 
-    # Tag the original as done so dashboards/tag views can filter it out.
+    # Tag the original with what was done to it (Decensored / Upscaled / both)
+    # so dashboards + Stash tag views can filter accordingly.
     try:
-        done = stash.find_tag(cfg.get("doneTag", "Decensored"), create=True)
+        tag_names = info.get("op_tags") or [cfg.get("doneTag", "Decensored")]
         cur = stash.find_scene(int(info["orig_scene_id"]), fragment="id tags { id }")
-        if done and cur:
+        if cur:
             ids = {t["id"] for t in cur.get("tags", [])}
-            ids.add(done["id"])
+            for name in tag_names:
+                tag = stash.find_tag(name, create=True)
+                if tag:
+                    ids.add(tag["id"])
             stash.update_scene({"id": info["orig_scene_id"], "tag_ids": list(ids)})
     except Exception as exc:  # noqa: BLE001 - tagging is best-effort
-        log.warning(f"Could not tag original as done: {exc}")
+        log.warning(f"Could not tag original: {exc}")
 
     p(1.0, "Replaced")
     return info["orig_scene_id"]

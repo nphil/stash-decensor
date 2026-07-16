@@ -98,7 +98,26 @@
     " id title date files { path width height duration size } studio { name } tags { name } } } }";
 
   function isDone(scene) {
-    return (scene.tags || []).some(function (t) { return /^Decensored/i.test(t.name); });
+    // shows the DONE badge on cards for processed scenes
+    return (scene.tags || []).some(function (t) { return /^(Decensored|Upscaled)/i.test(t.name); });
+  }
+
+  async function loadTags() {
+    // live tag list from Stash for the filter dropdown (busiest tags first)
+    var sel = $("tagf");
+    try {
+      var tags = await workerFetch("tags");
+      var saved = "";
+      try { saved = localStorage.getItem("dc_tag") || ""; } catch (e) {}
+      sel.innerHTML = "<option value=''>All tags</option>";
+      tags.forEach(function (t) {
+        var o = document.createElement("option");
+        o.value = t.id;
+        o.textContent = t.name + " (" + t.scene_count + ")";
+        sel.appendChild(o);
+      });
+      if (saved && sel.querySelector('option[value="' + saved + '"]')) sel.value = saved;
+    } catch (e) { /* dropdown stays with just "All tags" */ }
   }
 
   async function loadScenes() {
@@ -106,7 +125,7 @@
     var sort = $("sort").value;
     var qs = "scenes?q=" + encodeURIComponent($("search").value.trim()) +
       "&page=" + state.page + "&per_page=" + PER + "&sort=" + encodeURIComponent(sort) +
-      "&hide_done=" + ($("hideDone").checked ? 1 : 0);   // server-side -> full pages
+      "&tag=" + encodeURIComponent($("tagf").value);   // server-side tag filter
     var res;
     try { res = await workerFetch(qs); }
     catch (e) {
@@ -116,13 +135,11 @@
     }
     state.count = res.count;
     var minres = parseInt($("minres").value, 10) || 0;
-    var hideDone = $("hideDone").checked;
     grid.innerHTML = "";
     var shown = 0;
     res.scenes.forEach(function (s) {
       var f = (s.files || [])[0] || {};
       if (minres && (f.height || 0) < minres) return;
-      if (hideDone && isDone(s)) return;
       state.scenes[s.id] = { title: s.title || (f.path || "").split(/[\\/]/).pop() };
       shown++;
       grid.appendChild(sceneCard(s, f));
@@ -546,7 +563,11 @@
   function bind() {
     var deb;
     $("search").addEventListener("input", function () { clearTimeout(deb); deb = setTimeout(function () { state.page = 1; loadScenes(); }, 300); });
-    $("sort").onchange = $("minres").onchange = $("hideDone").onchange = function () { state.page = 1; loadScenes(); };
+    $("sort").onchange = $("minres").onchange = function () { state.page = 1; loadScenes(); };
+    $("tagf").onchange = function () {
+      try { localStorage.setItem("dc_tag", $("tagf").value); } catch (e) {}
+      state.page = 1; loadScenes();
+    };
     // engine choice persists across visits ("" was the old DeepMosaics default)
     try {
       var se = localStorage.getItem("dc_engine"), sq = localStorage.getItem("dc_ladaq");
@@ -581,6 +602,7 @@
     bind();
     await loadToken();
     await updateConn();
+    await loadTags();
     await loadScenes();
     pollJobs();
     pollGpu();

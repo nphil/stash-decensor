@@ -208,7 +208,8 @@ def _preview_loop(jid, out_dir, input_path, stop_evt):
     if not fps:
         push_log(jid, "preview: could not read source fps; preview disabled", "warn")
         return
-    announced = failed = False
+    announced = warned = False
+    misses = 0
     while not stop_evt.wait(2.0):
         try:
             with _jobs_lock:
@@ -224,16 +225,22 @@ def _preview_loop(jid, out_dir, input_path, stop_evt):
                 continue
             ok, err = _grab(part, t, os.path.join(pdir, "after.jpg"))
             if ok:
+                misses = 0
                 _grab(input_path, t, os.path.join(pdir, "before.jpg"))
                 if not announced:
                     announced = True
                     push_log(jid, "preview: live frames available", "event")
-            elif not failed:
-                failed = True             # log the first failure once, not a flood
-                push_log(jid, "preview grab failed: " + err, "warn")
+            else:
+                # The first attempts routinely race the encoder's first fragment
+                # flush ("Invalid data found") and self-heal — only warn when it
+                # keeps failing, which indicates a real problem.
+                misses += 1
+                if misses >= 5 and not warned:
+                    warned = True
+                    push_log(jid, "preview grabs failing repeatedly: " + err, "warn")
         except Exception as exc:  # noqa: BLE001 - preview must never break the job
-            if not failed:
-                failed = True
+            if not warned:
+                warned = True
                 push_log(jid, "preview loop error: " + str(exc), "warn")
 
 

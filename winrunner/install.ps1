@@ -89,6 +89,30 @@ icacls $cfgPath /inheritance:r /grant:r "${env:USERNAME}:(R,W)" "Administrators:
 Write-Host "config -> $cfgPath"
 try { New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name LongPathsEnabled -Value 1 -PropertyType DWord -Force | Out-Null } catch {}
 
+# --- 3b. reserve the port so WinNAT/Hyper-V can't grab it on reboot ---
+# Windows reserves blocks of ports for WinNAT/Hyper-V at boot, and those ranges
+# reshuffle on every reboot; if a block covers $Port the runner's bind fails with
+# WinError 10013 and it shows offline. An *administered* persistent exclusion
+# keeps $Port reserved for us across reboots and stays bindable by the runner.
+$portRow = "^\s*$Port\s+$Port\b"
+if (netsh int ipv4 show excludedportrange tcp | Select-String $portRow) {
+  Write-Host "port $Port already reserved (persistent exclusion present)"
+} else {
+  netsh int ipv4 add excludedportrange protocol=tcp startport=$Port numberofports=1 store=persistent 2>&1 | Out-Null
+  if (-not (netsh int ipv4 show excludedportrange tcp | Select-String $portRow)) {
+    # $Port sits inside a live WinNAT dynamic reservation - bounce winnat to carve it out
+    Write-Host "reserving port $Port (bouncing WinNAT)..."
+    Stop-Service winnat -Force -ErrorAction SilentlyContinue
+    netsh int ipv4 add excludedportrange protocol=tcp startport=$Port numberofports=1 store=persistent 2>&1 | Out-Null
+    Start-Service winnat -ErrorAction SilentlyContinue
+  }
+  if (netsh int ipv4 show excludedportrange tcp | Select-String $portRow) {
+    Write-Host "reserved TCP $Port for the runner (persistent; survives reboots)"
+  } else {
+    Write-Warning "could not reserve TCP $Port - if the runner shows WinError 10013, reserve it manually"
+  }
+}
+
 # --- 4. remove any old WinSW service; register the logon task ---
 $winsw = "$Root\$SvcId.exe"
 if (Test-Path $winsw) { & $winsw stop 2>$null | Out-Null; & $winsw uninstall 2>$null | Out-Null; Write-Host "removed old WinSW service" }

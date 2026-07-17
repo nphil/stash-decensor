@@ -63,6 +63,17 @@ except Exception:  # noqa: BLE001
     pass
 
 
+# Route any uncaught exception to the log too. Launched windowless (scheduled
+# task -> run-hidden.vbs), stderr goes nowhere, so a crash at startup - e.g. the
+# port bind failing - would otherwise leave no trace beyond a silent exit.
+def _log_uncaught(exc_type, exc, tb):
+    log.critical("uncaught exception - runner exiting", exc_info=(exc_type, exc, tb))
+    sys.__excepthook__(exc_type, exc, tb)
+
+
+sys.excepthook = _log_uncaught
+
+
 # --------------------------------------------------------------------------- #
 # config
 # --------------------------------------------------------------------------- #
@@ -987,7 +998,23 @@ def main():
     bind = "0.0.0.0" if TOKEN else "127.0.0.1"
     if not TOKEN:
         log.warning("no token set - binding 127.0.0.1 only and DENYING API calls. Set a token to accept remote jobs.")
-    httpd = ThreadingHTTPServer((bind, PORT), Handler)
+    try:
+        httpd = ThreadingHTTPServer((bind, PORT), Handler)
+    except OSError as e:
+        win = getattr(e, "winerror", None)
+        if win == 10013:   # WSAEACCES - port is reserved, not in use
+            log.critical(
+                "cannot bind %s:%s - WinError 10013: the port is reserved by Windows "
+                "(WinNAT/Hyper-V dynamic pool; these ranges reshuffle every reboot). "
+                "Reserve it permanently in an ELEVATED shell:  net stop winnat  &&  "
+                "netsh int ipv4 add excludedportrange protocol=tcp startport=%s numberofports=1 store=persistent"
+                "  &&  net start winnat   (inspect with: netsh int ipv4 show excludedportrange tcp)",
+                bind, PORT, PORT)
+        elif win == 10048:   # WSAEADDRINUSE
+            log.critical("cannot bind %s:%s - WinError 10048: another process is already using this port.", bind, PORT)
+        else:
+            log.critical("cannot bind %s:%s - %s", bind, PORT, e)
+        raise
     log.info("stashify-winrunner '%s' on %s:%s | ops=%s | ffmpeg=%s",
              CFG["node_name"], bind, PORT, enabled_ops(), FFMPEG)
     try:

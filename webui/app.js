@@ -837,19 +837,31 @@
   }
 
   // ---- live GPU meter (topbar) ------------------------------------------- //
-  async function pollGpu() {
-    var box = $("gpumeter"), txt = $("gpumeter-text");
+  async function pollGpus() {
+    // One live meter per worker; the runner actively running a Stashify job is highlighted.
+    var box = $("gpumeters");
     if (!box) return;
-    try {
-      var g = await (await fetch(workerUrl("gpu"))).json();
-      if (g && g.util != null) {
+    var list;
+    try { list = await (await fetch(workerUrl("gpus"))).json(); }
+    catch (e) { return; }
+    if (!Array.isArray(list)) return;
+    box.innerHTML = "";
+    list.forEach(function (r) {
+      var g = r.gpu || {};
+      var pill = el("div", "gpumeter" + (r.active ? " active" : "") + (r.online ? "" : " off"));
+      pill.title = r.name + (r.active ? " — running a Stashify job" : (r.online ? " — idle" : " — offline"));
+      pill.appendChild(el("span", "gpudot"));
+      var nm = el("span", "gpu-name"); nm.textContent = r.name; pill.appendChild(nm);
+      var txt = el("span", "gpu-txt");
+      if (!r.online) txt.textContent = "offline";
+      else if (g.util != null) {
         var vram = (g.mem_used != null && g.mem_total != null)
-          ? " · " + (g.mem_used / 1024).toFixed(1) + "/" + Math.round(g.mem_total / 1024) + " GB" : "";
-        txt.textContent = "GPU " + Math.round(g.util) + "%" + vram + (g.temp != null ? " · " + Math.round(g.temp) + "°C" : "");
-        box.hidden = false;
-        box.classList.toggle("busy", g.util >= 5);
-      } else { box.hidden = true; }
-    } catch (e) { box.hidden = true; }
+          ? " · " + (g.mem_used / 1024).toFixed(1) + "/" + Math.round(g.mem_total / 1024) + "GB" : "";
+        txt.textContent = Math.round(g.util) + "%" + vram + (g.temp != null ? " · " + Math.round(g.temp) + "°" : "");
+      } else txt.textContent = "—";
+      pill.appendChild(txt);
+      box.appendChild(pill);
+    });
   }
 
   // ---- runners management ------------------------------------------------ //
@@ -1060,10 +1072,10 @@
     await loadTags();
     await loadScenes();
     pollJobs();
-    pollGpu();
+    pollGpus();
     state.pollTimer = setInterval(pollJobs, 1500);
     setInterval(updateConn, 15000);
-    setInterval(pollGpu, 3000);
+    setInterval(pollGpus, 3000);
   }
   main();
 })();

@@ -1024,10 +1024,19 @@ def _scan_mosaics(jid, src):
     if not data:
         push_log(jid, "preview: scan produced no ranges", "warn")
         return "", None
+    # If the scan couldn't decode most of the video, DON'T trust its ranges: smart mode
+    # would leave the unscanned tail censored. Fall back to a full decensor (jasna does its
+    # own reliable whole-video detection) - correctness over the preview/speed.
+    if data.get("incomplete") or (data.get("coverage") is not None and data.get("coverage") < 0.9):
+        push_log(jid, "preview: scan only covered %.0f%% of the video - falling back to a FULL "
+                 "decensor so nothing is missed (no smart-mode preview this run)"
+                 % (100.0 * (data.get("coverage") or 0.0)), "warn")
+        return "", None
     ranges = data.get("ranges") or []
-    push_log(jid, "preview: %d mosaic range(s) via %s (%d/%d samples, max %.2f)" % (
+    push_log(jid, "preview: %d mosaic range(s) via %s (%d/%d samples, %.0f%% coverage, max %.2f)" % (
         len(ranges), data.get("provider", "?"), data.get("n_hits", 0),
-        data.get("n_samples", 0), data.get("max_score", 0.0)), "event")
+        data.get("n_samples", 0), 100.0 * (data.get("coverage") or 1.0),
+        data.get("max_score", 0.0)), "event")
     return data.get("segments", ""), ranges
 
 

@@ -106,7 +106,8 @@ h1, h2, h3 { text-wrap: balance; }
 .conn.ok { color: var(--ok); }
 .conn.err { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
 
-/* live GPU meter */
+/* live per-worker GPU meters */
+.gpumeters { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .gpumeter {
   display: inline-flex; align-items: center; gap: 7px;
   font: 12px/1 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
@@ -115,8 +116,13 @@ h1, h2, h3 { text-wrap: balance; }
   border-radius: var(--r-pill); padding: 6px 11px;
 }
 .gpumeter .gpudot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
-.gpumeter.busy { color: var(--text); border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); }
-.gpumeter.busy .gpudot { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+.gpumeter .gpu-name { color: var(--text); font-weight: 600; }
+.gpumeter .gpu-txt { font-variant-numeric: tabular-nums; }
+.gpumeter.off { opacity: 0.5; }
+.gpumeter.off .gpudot { background: var(--danger); }
+/* the worker actively running a Stashify job */
+.gpumeter.active { color: var(--text); border-color: color-mix(in srgb, var(--ok) 45%, var(--line)); }
+.gpumeter.active .gpudot { background: var(--ok); box-shadow: 0 0 8px var(--ok); animation: livepulse 1.6s ease-in-out infinite; }
 
 /* ============================================================================
    Buttons

@@ -283,6 +283,24 @@ def run_scan(args):
             return run_scan(args)
         raise
 
+    # Coverage guard. NVDEC (-hwaccel cuda) can hit a CLEAN early EOF on some HEVC files -
+    # ffmpeg exits 0 with no error, so the except above never fires, and we'd silently scan
+    # only the first minutes and leave the rest of the video un-restored. If we covered
+    # materially less than the probed duration, retry with software decode; if even that
+    # falls short, flag the scan incomplete so the caller can fall back to a full decensor
+    # rather than ship a video with most of its mosaics untouched.
+    expected = max(1, int(dur * rate))
+    covered_s = len(scores) / rate if scores else 0.0
+    incomplete = len(scores) < 0.9 * expected
+    if incomplete and args.hwaccel == "cuda" and not args._no_hw:
+        log("scan: decode covered only ~%.0f/%.0fs (%d/%d samples); retrying software decode"
+            % (covered_s, dur, len(scores), expected))
+        args._no_hw = True
+        return run_scan(args)
+    if incomplete:
+        log("scan: WARNING decode reached only ~%.0f/%.0fs (%d/%d samples) - scan is INCOMPLETE; "
+            "mosaics after that point would NOT be restored" % (covered_s, dur, len(scores), expected))
+
     ranges = segments_from_scores(times, scores, args.threshold, args.stride_seconds,
                                   dur, pad=args.pad)
     n_hits = sum(1 for s in scores if s >= args.threshold)
@@ -295,6 +313,8 @@ def run_scan(args):
         "duration": round(dur, 3),
         "n_samples": len(scores),
         "n_hits": n_hits,
+        "coverage": round(len(scores) / expected, 3),   # fraction of the video actually scanned
+        "incomplete": bool(incomplete),
         "provider": scorer.provider_name,
         "max_score": round(max(scores), 4) if scores else 0.0,
     }

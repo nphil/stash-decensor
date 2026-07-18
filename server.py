@@ -236,8 +236,10 @@ _work = queue.Queue()
 _stash = None
 _stash_lock = threading.Lock()
 _running_job_id = None          # the job whose subprocess is live (for cancel/pause)
-_gpu = {}                       # latest GPU stats, refreshed by gpu_poller
+_gpu = {}                       # active runner's GPU (back-compat: /api/gpu + job.gpu_stats)
 _gpu_lock = threading.Lock()
+_gpus = []                      # per-runner rows: {name,url,online,active,gpu:{...}}
+_gpus_lock = threading.Lock()
 
 # --------------------------------------------------------------------------- #
 # per-job live log buffer
@@ -342,48 +344,91 @@ def _numf(s):
         return None
 
 
-def _read_gpu():
-    """GPU telemetry. The slim worker has no GPU — the compute runner owns it,
-    so ask the runner's /gpu endpoint; fall back to local nvidia-smi for
-    deployments that still run the worker on the GPU host."""
-    runner = (os.environ.get("RUNNER_URL") or os.environ.get("LADA_URL") or "").rstrip("/")
-    if runner:
-        try:
-            import requests
+def _gpu_targets():
+    """Every runner to poll for GPU telemetry: the merged registry + the RUNNER_URL/
+    LADA_URL fallback (deduped by url)."""
+    targets, seen = [], set()
+    for r in merged_runners():
+        url = str(r.get("url", "")).rstrip("/")
+        if url and url not in seen:
+            seen.add(url)
+            targets.append({"name": r.get("name") or url, "url": url,
+                            "token": r.get("token") or os.environ.get("WORKER_TOKEN", "")})
+    fb = (os.environ.get("RUNNER_URL") or os.environ.get("LADA_URL") or "").rstrip("/")
+    if fb and fb not in seen:
+        targets.append({"name": "default", "url": fb,
+                        "token": (os.environ.get("RUNNER_TOKEN") or os.environ.get("LADA_TOKEN")
+                                  or os.environ.get("WORKER_TOKEN", ""))})
+    return targets
 
-            r = requests.get(runner + "/gpu", timeout=5)
-            if r.ok:
-                data = r.json()
-                if data:
-                    return data
-        except Exception:  # noqa: BLE001
-            pass
+
+def _read_runner_gpu(url, token):
+    """One runner's /gpu (flat {util,mem_used,mem_total,temp,power}), or None if unreachable."""
+    import requests
+    try:
+        r = requests.get(url + "/gpu", headers={"X-Runner-Token": token, "X-Lada-Token": token}, timeout=3)
+        if r.ok:
+            d = r.json()
+            if isinstance(d, dict) and d.get("util") is not None:
+                return {"util": _numf(d.get("util")), "mem_used": _numf(d.get("mem_used")),
+                        "mem_total": _numf(d.get("mem_total")), "temp": _numf(d.get("temp")),
+                        "power": _numf(d.get("power"))}
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _local_nvidia():
+    """Local nvidia-smi, for a worker that still runs on the GPU host (no separate runner)."""
     gid = os.environ.get("GPU_ID", "0")
     if str(gid).strip() in ("", "-1"):
-        return {}
+        return None
     try:
         q = "utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw"
-        out = subprocess.run(
-            ["nvidia-smi", "-i", str(gid), "--query-gpu=" + q, "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if out.returncode != 0 or not out.stdout.strip():
-            return {}
-        v = [x.strip() for x in out.stdout.strip().splitlines()[0].split(",")]
-        if len(v) < 5:
-            return {}
-        return {"util": _numf(v[0]), "mem_used": _numf(v[1]), "mem_total": _numf(v[2]),
-                "temp": _numf(v[3]), "power": _numf(v[4])}
+        out = subprocess.run(["nvidia-smi", "-i", str(gid), "--query-gpu=" + q,
+                              "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5)
+        if out.returncode == 0 and out.stdout.strip():
+            v = [x.strip() for x in out.stdout.strip().splitlines()[0].split(",")]
+            if len(v) >= 5:
+                return {"util": _numf(v[0]), "mem_used": _numf(v[1]), "mem_total": _numf(v[2]),
+                        "temp": _numf(v[3]), "power": _numf(v[4])}
     except (Exception, FileNotFoundError):  # noqa: BLE001
-        return {}
+        pass
+    return None
+
+
+def _active_runner_names():
+    """Runners currently executing a Stashify job (so the UI can flag active GPU use)."""
+    with _jobs_lock:
+        return {j.get("runner") for j in _jobs.values()
+                if j.get("state") in ("running", "replacing", "discarding") and j.get("runner")}
 
 
 def gpu_poller():
     while True:
-        stats = _read_gpu()
-        with _gpu_lock:
-            _gpu.clear()
-            _gpu.update(stats)
+        try:
+            active = _active_runner_names()
+            rows = []
+            for t in _gpu_targets():
+                g = _read_runner_gpu(t["url"], t["token"])
+                rows.append({"name": t["name"], "url": t["url"], "online": g is not None,
+                             "active": t["name"] in active, "gpu": g or {}})
+            if not rows:                                  # worker-on-GPU-host fallback
+                lg = _local_nvidia()
+                if lg is not None:
+                    rows.append({"name": "local", "url": "", "online": True,
+                                 "active": bool(active), "gpu": lg})
+            # back-compat singular: the active runner's GPU, else the busiest online one
+            pick = next((r["gpu"] for r in rows if r["active"] and r["gpu"]), None)
+            if pick is None:
+                on = [r for r in rows if r["gpu"] and r["gpu"].get("util") is not None]
+                pick = max(on, key=lambda r: r["gpu"].get("util") or 0)["gpu"] if on else {}
+            with _gpus_lock:
+                _gpus[:] = rows
+            with _gpu_lock:
+                _gpu.clear(); _gpu.update(pick)
+        except Exception:  # noqa: BLE001 - telemetry must never crash the poller
+            pass
         time.sleep(2)
 
 
@@ -588,8 +633,16 @@ def public(job):
     sa = job.get("started_at")
     if sa:
         out["elapsed"] = int((job.get("_ended_at") or time.time()) - sa)
-    with _gpu_lock:
-        out["gpu_stats"] = dict(_gpu)
+    rn = job.get("runner")                 # this job's own runner GPU, not a global one
+    g = None
+    if rn:
+        with _gpus_lock:
+            row = next((r for r in _gpus if r.get("name") == rn), None)
+        g = dict(row["gpu"]) if row and row.get("gpu") else None
+    if not g:
+        with _gpu_lock:
+            g = dict(_gpu)
+    out["gpu_stats"] = g or {}
     out["log_cursor"] = job_log_cursor(job.get("id"))
     out["preview"] = preview_file(job.get("id"), "after") is not None
     out["segments"] = job_segments(job.get("id"))   # live mosaic-segment before/after clips
@@ -852,6 +905,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/gpu":
             with _gpu_lock:
                 return self._send(200, dict(_gpu))
+        if path == "/api/gpus":                 # per-runner GPU rows for the dashboard meters
+            with _gpus_lock:
+                return self._send(200, [dict(r) for r in _gpus])
         # Media proxies for the dashboard's <img>/<video> (which can't send the
         # token header) — left open; the worker sits behind your proxy's auth.
         m = re.match(r"^/api/(img|vid)/(\d+)$", path)

@@ -696,6 +696,7 @@ def run_job(lane, job):
                     if deblur in (_levels | {"none"}):
                         argv += ["--rtx-deblur", deblur]
             seg_stop = threading.Event()
+            _seg = _seg_thread = None
             if preview_on:
                 from preview import SegmentPreview
                 _seg = SegmentPreview(
@@ -709,10 +710,19 @@ def run_job(lane, job):
                     on_update=lambda segs: set_job(jid, segments=segs),
                     log=lambda m: push_log(jid, m, "event"))
                 set_job(jid, segments=[], preview_segments=True)
-                threading.Thread(target=_seg.run, args=(seg_stop,),
-                                 kwargs={"poll": 1.0}, daemon=True).start()
+                _seg_thread = threading.Thread(target=_seg.run, args=(seg_stop,),
+                                               kwargs={"poll": 1.0}, daemon=True)
+                _seg_thread.start()
             rc, cancelled = _stream_subprocess(lane, jid, argv, scale=(0, n_phases))
             seg_stop.set()
+            if _seg is not None and rc == 0 and not cancelled:
+                # let the watcher drain the last segments, then concat them into one
+                # smooth "decensored portions only" sample clip for review
+                if _seg_thread:
+                    _seg_thread.join(timeout=45)
+                set_job(jid, message="Building decensored sample")
+                if _seg.build_sample():
+                    set_job(jid, sample=True)
             if chain and rc == 0 and not cancelled:
                 mid = _newest_video(mid_dir)
                 if not mid:
@@ -838,6 +848,12 @@ def preview_path(jid, which):
 def seg_preview_path(jid, n, which):
     """Local path to a segment-preview clip (seg<N>_before/after.mp4), or None."""
     p = os.path.join(CFG["local_temp"], "preview_" + jid, "seg%d_%s.mp4" % (int(n), which))
+    return p if os.path.isfile(p) else None
+
+
+def sample_preview_path(jid):
+    """Local path to the concatenated decensored-only sample clip, or None."""
+    p = os.path.join(CFG["local_temp"], "preview_" + jid, "sample.mp4")
     return p if os.path.isfile(p) else None
 
 
@@ -1091,6 +1107,10 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             p = seg_preview_path(m.group(1), m.group(2), m.group(3))
             return self._send_file(p, "video/mp4") if p else self._send(404, {"error": "no segment"})
+        m = re.match(r"^/jobs/([0-9a-f]+)/sample\.mp4$", raw)
+        if m:
+            p = sample_preview_path(m.group(1))
+            return self._send_file(p, "video/mp4") if p else self._send(404, {"error": "no sample"})
         m = re.match(r"^/jobs/([0-9a-f]+)/segments$", raw)
         if m:
             with _jobs_lock:

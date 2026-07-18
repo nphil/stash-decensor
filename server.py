@@ -465,6 +465,19 @@ def _mirror_segments(info, jid, dest):
                 lst = _segments.setdefault(jid, [])
                 if not any(x["n"] == n for x in lst):
                     lst.append(s)
+    # mirror the concatenated decensored-only sample clip once the runner builds it
+    samp = os.path.join(dest, "sample.mp4")
+    if not os.path.isfile(samp):
+        try:
+            rr = requests.get("%s/jobs/%s/sample.mp4" % (info["base"], info["rid"]),
+                              headers=headers, timeout=60)
+            if rr.status_code == 200 and rr.content:
+                tmp = samp + ".tmp"
+                with open(tmp, "wb") as fh:
+                    fh.write(rr.content)
+                os.replace(tmp, samp)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def preview_poller():
@@ -501,6 +514,20 @@ def seg_file(job_id, n, which):
 def job_segments(job_id):
     with _seg_lock:
         return list(_segments.get(job_id, []))
+
+
+def sample_file(job_id):
+    p = os.path.join(PREVIEW_DIR, job_id, "sample.mp4")
+    return p if os.path.isfile(p) else None
+
+
+def _cleanup_preview(job_id):
+    """After keep/discard, drop the transient preview artifacts (segment clips +
+    the decensored sample reel). The full decensored video stays in Stash."""
+    import shutil
+    with _seg_lock:
+        _segments.pop(job_id, None)
+    shutil.rmtree(os.path.join(PREVIEW_DIR, job_id), ignore_errors=True)
 
 
 def live_source(job_id):
@@ -565,6 +592,7 @@ def public(job):
     out["log_cursor"] = job_log_cursor(job.get("id"))
     out["preview"] = preview_file(job.get("id"), "after") is not None
     out["segments"] = job_segments(job.get("id"))   # live mosaic-segment before/after clips
+    out["sample"] = sample_file(job.get("id")) is not None   # concatenated decensored-only reel
     return out
 
 
@@ -632,6 +660,7 @@ def do_replace(job):
     cfg = job_config(job)
     core.replace_original(get_stash(), cfg, info, progress=progress_cb(job_id))
     set_job(job_id, state="replaced", progress=1.0, message="Original replaced")
+    _cleanup_preview(job_id)          # keep the full video; drop the sample + segment clips
 
 
 def do_discard(job):
@@ -641,6 +670,7 @@ def do_discard(job):
     if info:
         core.discard_review(get_stash(), job_config(job), info)
     set_job(job_id, state="discarded", message="Preview discarded")
+    _cleanup_preview(job_id)
 
 
 ACTIONS = {"process": do_process, "replace": do_replace, "discard": do_discard}
@@ -867,6 +897,24 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, {"error": "no preview yet"})
             self.send_response(200)
             self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Cache-Control", "no-store")
+            self._cors()
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            return self.wfile.write(body)
+        # Decensored-only sample clip (loaded by <video>, unauth'd like the jpgs).
+        m = re.match(r"^/api/jobs/([0-9a-f]+)/sample\.mp4$", path)
+        if m:
+            p = sample_file(m.group(1))
+            if not p:
+                return self._send(404, {"error": "no sample"})
+            try:
+                with open(p, "rb") as fh:
+                    body = fh.read()
+            except OSError:
+                return self._send(404, {"error": "no sample"})
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
             self.send_header("Cache-Control", "no-store")
             self._cors()
             self.send_header("Content-Length", str(len(body)))

@@ -247,6 +247,8 @@ select {
 .segchip:hover { color: var(--text); }
 .segchip.on { background: #7e9cd8; color: #10131a; border-color: transparent; }
 .segduo video { cursor: default; }
+.sampleprev { margin-top: 10px; }
+.sampleprev video { width: 100%; border-radius: 8px; background: #000; display: block; }
 
 /* ---- live before/after preview ---- */
 .pv { display: flex; gap: 6px; margin-top: 8px; }

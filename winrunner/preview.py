@@ -140,6 +140,36 @@ class SegmentPreview:
         else:
             self._log("preview: segment encode failed (after=%s before=%s)" % (ok_a, ok_b))
 
+    def build_sample(self):
+        """Concatenate the decensored segment clips (in time order) into one smoothly
+        playable 'restored portions only' reel for review - no seeking needed. Returns
+        the sample path or None. Clips are all the same 720p h264, so -c copy is clean."""
+        if not self.segments:
+            return None
+        ordered = sorted(self.segments, key=lambda s: s["n"])
+        listing = os.path.join(self.prev_dir, "sample_concat.txt")
+        with open(listing, "w", encoding="utf-8") as fh:
+            for s in ordered:
+                clip = os.path.join(self.prev_dir, "seg%d_after.mp4" % s["n"])
+                if os.path.isfile(clip):
+                    fh.write("file '%s'\n" % clip.replace("\\", "/").replace("'", "'\\''"))
+        sample = os.path.join(self.prev_dir, "sample.mp4")
+        r = _run([self.ffmpeg, "-nostdin", "-loglevel", "error", "-y", "-f", "concat",
+                  "-safe", "0", "-i", listing, "-c", "copy", "-movflags", "+faststart",
+                  sample], timeout=180)
+        if r.returncode == 0 and os.path.isfile(sample) and os.path.getsize(sample) > 0:
+            self._log("preview: built decensored sample (%d segments)" % len(ordered))
+            return sample
+        # concat -c copy can fail on timestamp gaps; retry with a re-encode
+        r = _run([self.ffmpeg, "-nostdin", "-loglevel", "error", "-y", "-f", "concat",
+                  "-safe", "0", "-i", listing, "-c:v", self.encoder, "-pix_fmt", "yuv420p",
+                  "-movflags", "+faststart", sample], timeout=300)
+        if r.returncode == 0 and os.path.isfile(sample) and os.path.getsize(sample) > 0:
+            self._log("preview: built decensored sample (%d segments, re-encoded)" % len(ordered))
+            return sample
+        self._log("preview: sample build failed")
+        return None
+
     # -- main loop -------------------------------------------------------------
     def run(self, stop_event, poll=1.5):
         try:

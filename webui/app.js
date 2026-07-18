@@ -647,6 +647,16 @@
     c._refs.segw = segw; c._refs.segSel = segSel; c._refs.segA = segA; c._refs.segB = segB;
     c._refs.segCount = 0; c._refs.segN = -1;
     c.appendChild(segw);
+    // Decensored-only sample reel (built at job end): every restored segment back to
+    // back, so you can judge overall quality smoothly without seeking the full video.
+    var sampw = el("div", "sampleprev");
+    sampw.hidden = true;
+    sampw.appendChild(el("div", "seglbl", "Decensored sample — restored portions only"));
+    var sampV = el("video");
+    sampV.muted = true; sampV.playsInline = true; sampV.loop = true; sampV.controls = true; sampV.preload = "auto";
+    sampw.appendChild(sampV);
+    c._refs.sampw = sampw; c._refs.sampV = sampV; c._refs.sampSet = false;
+    c.appendChild(sampw);
     var ctl = el("div", "row");
     if (j.state === "running") {
       var pr = el("button", "btn", "Pause");
@@ -692,6 +702,12 @@
       else [].forEach.call(r.segSel.children, function (ch, k) {
         ch.className = "segchip" + (k === r.segN ? " on" : "");
       });
+    }
+    if (r.sampw && j.sample && !r.sampSet) {         // the concatenated sample reel is ready
+      r.sampSet = true;
+      r.sampV.src = workerUrl("jobs/" + j.id + "/sample.mp4");
+      r.sampV.load();
+      r.sampw.hidden = false;
     }
     if (r.titleText) r.titleText.nodeValue = jobName(j);
     if (j.state === "error") { if (r.err) r.err.textContent = j.error || j.message || "Failed"; return; }

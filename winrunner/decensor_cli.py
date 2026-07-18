@@ -78,6 +78,9 @@ def _bytes_in(paths):
 def normalize(seg):
     """Jasna tqdm segment -> lada-style progress line, or None if not progress."""
     seg = seg.replace(",", "")            # tqdm thousands separators in frame counts
+    # tqdm redraws with \r (no \n), so a following log line gets glued onto the
+    # bar; cut at that log timestamp so the progress line stays clean.
+    seg = re.split(r"\d{2}:\d{2}:\d{2}\s+jasna\.", seg, maxsplit=1)[0]
     if not _RE_HAS_PCT.search(seg) or "(" not in seg:
         return None
     # "Speed: 12.3fps" -> "Speed: 12.3 f/s" (the runner's fps regex wants f/s)
@@ -86,7 +89,51 @@ def normalize(seg):
     return "decensor: " + seg.strip()
 
 
+# debug-level noise we DON'T want in the dashboard log (per-batch pipeline internals)
+_RE_SPAM = re.compile(r"\[(decode|primary|secondary)\]|frame_start=|clip_q=|pending=|encode_q=")
+_RE_CLIP = re.compile(r"\bclip=(\d+)")
+
+
+def _make_forwarder():
+    """Turn jasna's --log-level debug stream into clean narration: collapse the
+    repetitive engine loads, surface a throttled 'restoring mosaic clip #N'
+    milestone (so a long silent-looking restore shows real motion), drop the
+    per-batch spam, and pass real phase/info/warning lines through."""
+    st = {"clip": -1, "eng": False, "last_clip": 0.0}
+
+    def forward(seg):
+        if "Loading TensorRT export" in seg or "using TRT sub-engines" in seg:
+            if not st["eng"]:
+                st["eng"] = True
+                log("jasna: loading models / TensorRT engines")
+            return
+        if "[remux]" in seg:                       # the final (otherwise silent) mux phase
+            log("decensor: muxing final output (audio + metadata)")
+            return
+        m = _RE_CLIP.search(seg)
+        if m:
+            c = int(m.group(1))
+            now = time.time()
+            if c != st["clip"] and now - st["last_clip"] >= 3.0:
+                st["clip"] = c
+                st["last_clip"] = now
+                log("decensor: restoring mosaic clip #%d" % c)
+            return
+        if _RE_SPAM.search(seg):
+            return
+        log("jasna: " + seg)
+    return forward
+
+
 def main():
+    # jasna emits tqdm block glyphs + non-ASCII paths; the runner reads us as
+    # utf-8, so force utf-8 out regardless of the spawn locale (Windows piped
+    # stdout defaults to cp1252 and would crash on those characters).
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
     ap.add_argument("--output-dir", required=True)
@@ -130,7 +177,7 @@ def main():
             "--detection-model", args.detection_model,
             "--max-clip-size", str(args.max_clip_size),
             "--working-directory", work_dir,
-            "--log-level", "info"]
+            "--log-level", "debug"]   # parsed into clean narration below (spam suppressed)
     if args.encoder_settings:
         argv += ["--encoder-settings", args.encoder_settings]
     if args.no_compile:
@@ -191,6 +238,7 @@ def main():
             log("decensor: working [%ds no tqdm]: %s%s" % (int(quiet), phase, tail))
     threading.Thread(target=heartbeat, daemon=True).start()
 
+    forward = _make_forwarder()
     rc = 1
     try:
         buf = b""
@@ -220,12 +268,13 @@ def main():
                         log(pending)
                         pending = None
                 else:
-                    log("jasna: " + seg)
+                    forward(seg)
         if pending:
             log(pending)            # flush the final (usually 100%) update
         tail = buf.decode("utf-8", "replace").strip()
         if tail:
-            log(("jasna: " + tail) if not normalize(tail) else normalize(tail))
+            t = normalize(tail)
+            log(t) if t else forward(tail)
         rc = proc.wait()
     finally:
         done.set()

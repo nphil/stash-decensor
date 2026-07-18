@@ -65,7 +65,7 @@ RUN sed -i 's/\r$//' /usr/local/bin/lada_entrypoint.sh && chmod +x /usr/local/bi
 ENV LADA_MODEL_WEIGHTS_DIR=/models \
     LADA_CLI=/opt/lada/.venv/bin/lada-cli \
     LADA_DIR=/opt/lada \
-    LADA_DEVICE=cuda \
+    RUNNER_DEVICE=cuda \
     PORT=8711
 EXPOSE 8711
 ENTRYPOINT ["/usr/local/bin/lada_entrypoint.sh"]

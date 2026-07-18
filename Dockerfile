@@ -17,8 +17,8 @@ COPY webui/ /app/webui/
 RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
 # Defaults for the runner-backed pipeline. Override in your compose/template.
-ENV BACKEND=lada \
-    LADA_SCRATCH=/scratch \
+ENV BACKEND=decensor \
+    RUNNER_SCRATCH=/scratch \
     OUTPUT_DIR=/data/stashify \
     TRIGGER_TAG=Decensor \
     DONE_TAG=Decensored \

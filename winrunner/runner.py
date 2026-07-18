@@ -144,6 +144,7 @@ def load_config():
     # live SEGMENT preview (jasna >=0.8.0 smart mode): scan mosaics -> --segments ->
     # tap the per-span fragments jasna writes -> before/after clips. Per-job opt-in.
     cfg.setdefault("jasna_preview", False)         # global default (jobs opt in per request)
+    cfg.setdefault("jasna_preview_copy_local", True)   # preview reads source twice (scan+jasna): copy local once (big win over WiFi/SMB)
     cfg.setdefault("jasna_scan_provider", "trt")   # trt = direct TensorRT (~7ms/frame); dml = onnxruntime DirectML (~150ms) fallback
     cfg.setdefault("jasna_preview_stride", 0.75)   # mosaic-scan sampling sec/sample (lower = better recall; cheap on TRT)
     cfg.setdefault("jasna_preview_height", 720)    # preview clip height (downscaled)
@@ -595,11 +596,21 @@ def run_job(lane, job):
     mid_dir = None
     jasna_work = None
     seg_stop = None                     # segment-preview watcher stop event
-    if CFG["copy_local"] and op in ("upscale", "decensor", "decensor+upscale"):
+    # Copy the source local when it will be read more than once or over a slow link.
+    # A live-preview decensor reads it TWICE (mosaic scan + jasna), so one bulk
+    # sequential copy beats decode-paced double-streaming - a big win over WiFi/SMB.
+    _preview_req = bool(o.get("preview") or CFG.get("jasna_preview"))
+    _want_copy = CFG["copy_local"] or (
+        _preview_req and CFG.get("jasna_preview_copy_local", True)
+        and op in ("decensor", "decensor+upscale"))
+    if _want_copy and op in ("upscale", "decensor", "decensor+upscale"):
         os.makedirs(CFG["local_temp"], exist_ok=True)
         tmp_copy = os.path.join(CFG["local_temp"], "in_" + jid + os.path.splitext(src)[1])
-        push_log(jid, "copying source local...", "event")
+        _gb = (os.path.getsize(src) / (1 << 30)) if os.path.isfile(src) else 0.0
+        set_job(jid, stage="copy", message="Copying source local (%.1f GB)" % _gb)
+        push_log(jid, "copying source local (%.1f GB, one-time bulk read)..." % _gb, "event")
         shutil.copyfile(src, tmp_copy)
+        push_log(jid, "source copied local; scan + decensor now read local disk", "event")
         src = tmp_copy
 
     stop_preview = threading.Event()

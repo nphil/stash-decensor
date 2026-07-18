@@ -486,6 +486,7 @@ def _runner_dispatch(cfg, input_path, result_dir, op, on_line=None, log_cb=None)
         "codec": cfg.get("transcodeCodec") or "",
         "height": cfg.get("transcodeHeight") or "",
         "quality": cfg.get("transcodeQuality") or "24",
+        "secondary": cfg.get("secondary") or "",   # decensor secondary restoration (rtx-super-res)
     }
 
     def _post(action):

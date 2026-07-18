@@ -112,6 +112,7 @@
       state.runnerCaps = (rs || []).filter(function (r) { return r.online; });
     } catch (e) { /* keep last-known caps */ }
     rebuildPins();
+    if (typeof updateRtx === "function") updateRtx();
     var any = state.runnerCaps.length > 0;   // gate the controls on real availability, not env
     ["engine", "enginePin", "runnerPin"].forEach(function (id) { var s = $(id); if (s) s.disabled = !any; });
     if ($("engine")) $("engine").title = any ? "Operation" : "no compute runner online";
@@ -160,6 +161,20 @@
       return chosenEng === "auto" || (r.engines || {})[op] === chosenEng;
     }).map(function (r) { return r.name; });
     fillSelect(rpin, "Auto runner", runners, null, wantR);
+  }
+  // RTX Super Res is a jasna-only secondary detail pass. Offer it only for a
+  // decensor-family op where a jasna runner is actually online, and never when
+  // the engine pin is forced to a non-jasna engine (e.g. lada).
+  function updateRtx() {
+    var wrap = $("rtxWrap");
+    if (!wrap) return;
+    var op = opForOperation($("engine").value);
+    var isDecensor = op === "decensor" || op === "decensor+upscale";
+    var jasnaAvail = enginesForOp(op).indexOf("jasna") >= 0;
+    var epin = $("enginePin");
+    var pin = epin ? epin.value : "auto";
+    var pinOk = pin === "auto" || pin === "jasna";
+    wrap.hidden = !(isDecensor && jasnaAvail && pinOk);
   }
   var _previewTimer;
   function updatePreview() { clearTimeout(_previewTimer); _previewTimer = setTimeout(doPreview, 150); }
@@ -287,6 +302,13 @@
     var epin = $("enginePin"), rpin = $("runnerPin");
     if (epin && epin.value !== "auto" && !epin.hidden) extra.engine = epin.value;
     if (rpin && rpin.value !== "auto") extra.runner = rpin.value;
+    // RTX Super Res: jasna-only secondary detail pass. Force the jasna engine so
+    // it can't route to a runner that ignores it.
+    var rtx = $("rtxToggle");
+    if (rtx && rtx.checked && !$("rtxWrap").hidden && (backend === "decensor")) {
+      extra.secondary = "rtx-super-res";
+      if (!extra.engine) extra.engine = "jasna";
+    }
     var ok = 0;
     for (var i = 0; i < ids.length; i++) {
       try {
@@ -778,6 +800,7 @@
       if (sq) $("ladaq").value = sq;
       _pinRestore.engine = localStorage.getItem("dc_enginePin");   // applied once options exist
       _pinRestore.runner = localStorage.getItem("dc_runnerPin");
+      if ($("rtxToggle")) $("rtxToggle").checked = localStorage.getItem("dc_rtx") === "1";
     } catch (e) {}
     var syncEngine = function () {
       var e = $("engine").value;
@@ -785,6 +808,7 @@
       var jasna = $("enginePin") && $("enginePin").value === "jasna";
       $("ladaq").hidden = e === "upscale" || e === "transcode" || jasna;  // Lada-only detect model
       $("txq").hidden = e !== "transcode";
+      updateRtx();
       refreshSelBtn();
       renderConn();
       updatePreview();
@@ -804,6 +828,9 @@
     };
     $("ladaq").onchange = function () {
       try { localStorage.setItem("dc_ladaq", $("ladaq").value); } catch (e) {}
+    };
+    if ($("rtxToggle")) $("rtxToggle").onchange = function () {
+      try { localStorage.setItem("dc_rtx", $("rtxToggle").checked ? "1" : "0"); } catch (e) {}
     };
     $("prev").onclick = function () { if (state.page > 1) { state.page--; loadScenes(); } };
     $("next").onclick = function () { state.page++; loadScenes(); };

@@ -133,6 +133,13 @@ def load_config():
     cfg.setdefault("jasna_max_clip_size", 90)    # 90 fits 10GB VRAM; 180 needs 12GB+
     cfg.setdefault("jasna_encoder_settings", "")  # e.g. "cq=23,lookahead=32"
     cfg.setdefault("jasna_no_compile", False)     # skip TRT compile of BasicVSR++
+    # secondary restoration (RTX Super Res etc.) - 3080-only extra-detail pass after
+    # the mosaic restore. "" = off default; a job can opt in per-request.
+    cfg.setdefault("jasna_secondary", "")
+    cfg.setdefault("jasna_rtx_scale", 4)
+    cfg.setdefault("jasna_rtx_quality", "ultra")
+    cfg.setdefault("jasna_rtx_denoise", "")       # "" = jasna default
+    cfg.setdefault("jasna_rtx_deblur", "")
     cfg["local_temp"] = _expand(cfg.get("local_temp") or os.path.join(HERE, "tmp"))
     cfg["ffmpeg"] = resolve_ffmpeg(cfg.get("ffmpeg", "auto"))
     cfg["path_map"] = sorted(
@@ -599,6 +606,16 @@ def run_job(lane, job):
                 argv += ["--encoder-settings", str(CFG["jasna_encoder_settings"])]
             if CFG["jasna_no_compile"]:
                 argv.append("--no-compile")
+            # secondary restoration (RTX Super Res etc.): per-job override, else config default
+            secondary = str(o.get("secondary") or CFG.get("jasna_secondary") or "").strip()
+            if secondary and secondary != "none":
+                argv += ["--secondary-restoration", secondary,
+                         "--rtx-scale", str(CFG.get("jasna_rtx_scale", 4)),
+                         "--rtx-quality", str(CFG.get("jasna_rtx_quality", "ultra"))]
+                if CFG.get("jasna_rtx_denoise"):
+                    argv += ["--rtx-denoise", str(CFG["jasna_rtx_denoise"])]
+                if CFG.get("jasna_rtx_deblur"):
+                    argv += ["--rtx-deblur", str(CFG["jasna_rtx_deblur"])]
             rc, cancelled = _stream_subprocess(lane, jid, argv, scale=(0, n_phases))
             if chain and rc == 0 and not cancelled:
                 mid = _newest_video(mid_dir)

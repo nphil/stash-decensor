@@ -100,6 +100,7 @@ OVERRIDES = {
     "transcode_quality": "transcodeQuality",
     "runner": "targetRunner",              # pin this job to a specific runner (name or url)
     "engine": "targetEngine",              # pin this job to a specific engine (lada | jasna | span)
+    "secondary": "secondary",              # decensor secondary restoration (rtx-super-res; jasna-only)
 }
 
 # --------------------------------------------------------------------------- #

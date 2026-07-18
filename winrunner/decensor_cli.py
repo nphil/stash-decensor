@@ -150,6 +150,12 @@ def main():
                          "CALLER also cleans up: if we are tree-killed (cancel/stall) "
                          "our own cleanup never runs.")
     ap.add_argument("--extra", default="", help="extra raw args appended to jasna")
+    ap.add_argument("--secondary-restoration", default="none",
+                    help="jasna secondary restoration: none | rtx-super-res | unet-4x | tvai")
+    ap.add_argument("--rtx-scale", default="4")
+    ap.add_argument("--rtx-quality", default="ultra")
+    ap.add_argument("--rtx-denoise", default="")
+    ap.add_argument("--rtx-deblur", default="")
     args = ap.parse_args()
 
     if not os.path.isfile(args.jasna):
@@ -182,6 +188,17 @@ def main():
         argv += ["--encoder-settings", args.encoder_settings]
     if args.no_compile:
         argv.append("--no-compile-basicvsrpp")
+    sec = (args.secondary_restoration or "none").strip()
+    if sec and sec != "none":
+        argv += ["--secondary-restoration", sec]
+        if sec == "rtx-super-res":
+            argv += ["--rtx-scale", str(args.rtx_scale), "--rtx-quality", args.rtx_quality]
+            if args.rtx_denoise:
+                argv += ["--rtx-denoise", args.rtx_denoise]
+            if args.rtx_deblur:
+                argv += ["--rtx-deblur", args.rtx_deblur]
+        extra = f" (rtx {args.rtx_quality}/{args.rtx_scale}x)" if sec == "rtx-super-res" else ""
+        log("decensor: secondary restoration = " + sec + extra)
     if args.extra:
         argv += args.extra.split()
 

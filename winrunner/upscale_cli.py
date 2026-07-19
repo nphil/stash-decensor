@@ -268,9 +268,12 @@ def main():
                     log(f"upscaling: {pct:3d}%| |Processed: {hms(done / float(fps))} ({done}f) | "
                         f"Remaining: {remain} | Speed: {rate:.1f}f/s")
     finally:
+        # On a normal finish both joins return promptly. On an SR error the decoder may be
+        # blocked on a full queue (main stopped consuming); the timeouts + daemon threads
+        # avoid wedging the lane (the process exit reaps the daemons).
         enc_q.put(SENTINEL)
-        eth.join()
-        dth.join()
+        eth.join(timeout=120)
+        dth.join(timeout=5)
     out_c.close()
     in_c.close()
     if err:

@@ -13,7 +13,9 @@ The TensorRT engine is per-resolution and cached next to the weights
 import os
 import sys
 import time
+import queue
 import argparse
+import threading
 import subprocess
 
 import av
@@ -212,30 +214,67 @@ def main():
     done = 0
     last = 0.0
     fb_dtype = torch.half if (use_half and trt_up is None) else torch.float32
-    with torch.no_grad():
-        for frame in in_c.decode(vs):
-            img = frame.to_ndarray(format="rgb24")
-            ten = torch.from_numpy(img).to(dev).permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
-            if trt_up is not None:
-                out = trt_up.run(ten)
-            else:
-                out = fb_model(ten.to(fb_dtype))
-            arr = out.float().clamp_(0, 1).mul_(255.0).round_().byte()[0].permute(1, 2, 0).cpu().numpy()
-            for pkt in ostream.encode(av.VideoFrame.from_ndarray(arr, format="rgb24")):
+    # Pipeline the three stages so the (~4K) decode and rgb->yuv->NVENC encode overlap the
+    # SR instead of running serially after it — roughly doubles end-to-end throughput.
+    SENTINEL = object()
+    dec_q = queue.Queue(maxsize=6)        # decoded rgb frames (CPU)
+    enc_q = queue.Queue(maxsize=6)        # upscaled rgb frames (CPU), ready to encode
+    err = {}
+
+    def _decode():
+        try:
+            for frame in in_c.decode(vs):
+                dec_q.put(frame.to_ndarray(format="rgb24"))
+        except Exception as exc:  # noqa: BLE001
+            err["decode"] = exc
+        finally:
+            dec_q.put(SENTINEL)
+
+    def _encode():
+        try:
+            while True:
+                arr = enc_q.get()
+                if arr is SENTINEL:
+                    break
+                for pkt in ostream.encode(av.VideoFrame.from_ndarray(arr, format="rgb24")):
+                    out_c.mux(pkt)
+            for pkt in ostream.encode():
                 out_c.mux(pkt)
-            done += 1
-            now = time.time()
-            if now - last >= 2.0:
-                last = now
-                rate = done / max(0.001, now - t0)
-                pct = int(100 * done / total) if total else 0
-                remain = hms((total - done) / rate) if total and rate > 0 else "?"
-                log(f"upscaling: {pct:3d}%| |Processed: {hms(done / float(fps))} ({done}f) | "
-                    f"Remaining: {remain} | Speed: {rate:.1f}f/s")
-    for pkt in ostream.encode():
-        out_c.mux(pkt)
+        except Exception as exc:  # noqa: BLE001
+            err["encode"] = exc
+            while enc_q.get() is not SENTINEL:   # drain so the SR thread can't deadlock
+                pass
+
+    dth = threading.Thread(target=_decode, daemon=True); dth.start()
+    eth = threading.Thread(target=_encode, daemon=True); eth.start()
+
+    try:
+        with torch.no_grad():
+            while True:
+                img = dec_q.get()
+                if img is SENTINEL:
+                    break
+                ten = torch.from_numpy(img).to(dev).permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
+                out = trt_up.run(ten) if trt_up is not None else fb_model(ten.to(fb_dtype))
+                arr = out.float().clamp_(0, 1).mul_(255.0).round_().byte()[0].permute(1, 2, 0).cpu().numpy()
+                enc_q.put(arr)
+                done += 1
+                now = time.time()
+                if now - last >= 2.0:
+                    last = now
+                    rate = done / max(0.001, now - t0)
+                    pct = int(100 * done / total) if total else 0
+                    remain = hms((total - done) / rate) if total and rate > 0 else "?"
+                    log(f"upscaling: {pct:3d}%| |Processed: {hms(done / float(fps))} ({done}f) | "
+                        f"Remaining: {remain} | Speed: {rate:.1f}f/s")
+    finally:
+        enc_q.put(SENTINEL)
+        eth.join()
+        dth.join()
     out_c.close()
     in_c.close()
+    if err:
+        raise list(err.values())[0]
     rate = done / max(0.001, time.time() - t0)
     log(f"upscaled {done} frames in {hms(time.time() - t0)} ({rate:.1f}f/s); muxing audio")
 

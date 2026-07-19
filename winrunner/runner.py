@@ -643,15 +643,28 @@ def _purge(path, tries=8, delay=0.5):
         pass
 
 
-def _copy_with_progress(jid, src, dst, label="Copying source local"):
+def _copy_with_progress(jid, src, dst, label="Copying source local", stage="copy", hold=None):
     """Chunked copy that drives the job's progress bar + status, so a multi-GB
-    copy over a slow link isn't a frozen-looking wait. stage='copy'."""
+    copy over a slow link isn't a frozen-looking wait.
+
+    stage/hold let a POST-op copy (e.g. the finished decensor result -> NAS) stay in the
+    op's band with the bar pinned (hold=1.0): stage='copy' maps to the coordinator's early
+    [0,6%] band, so using it after a ~100% phase would jump the bar backward - instead pass
+    stage=op, hold=1.0 and show the % in the message only."""
     total = os.path.getsize(src) if os.path.isfile(src) else 0
     gb = total / (1 << 30)
     copied = 0
     last = 0.0
-    set_job(jid, stage="copy", progress=0.0, indeterminate=False,
-            message="%s (%.1f GB)" % (label, gb))
+
+    def _set(pct, done=False):
+        set_job(jid, stage=stage, indeterminate=False,
+                progress=(hold if hold is not None else (1.0 if done else round(pct, 3))),
+                message=("%s - done" % label) if done else
+                        ("%s - %d%% (%.1f / %.1f GB)" % (label, int(pct * 100),
+                                                         copied / (1 << 30), gb) if total else
+                         "%s (%.1f GB)" % (label, gb)))
+
+    _set(0.0)
     with open(src, "rb") as fi, open(dst, "wb") as fo:
         while True:
             chunk = fi.read(8 << 20)              # 8 MB
@@ -662,11 +675,8 @@ def _copy_with_progress(jid, src, dst, label="Copying source local"):
             now = time.time()
             if now - last >= 1.0 and total:
                 last = now
-                pct = copied / total
-                set_job(jid, stage="copy", progress=round(pct, 3),
-                        message="%s - %d%% (%.1f / %.1f GB)" % (label, int(pct * 100),
-                                                               copied / (1 << 30), gb))
-    set_job(jid, progress=1.0, message="%s - done" % label)
+                _set(copied / total)
+    _set(1.0, done=True)
 
 
 def run_job(lane, job):
@@ -736,9 +746,13 @@ def run_job(lane, job):
                 raise RuntimeError("decensor not available: set jasna_exe in config")
             chain = (op == "decensor+upscale")
             n_phases = 2 if chain else 1
-            if chain:
-                mid_dir = os.path.join(CFG["local_temp"], "mid_" + jid)
-                os.makedirs(mid_dir, exist_ok=True)
+            # Run jasna entirely on LOCAL disk (fragments + smart-render concat + mux),
+            # not over SMB to the NAS scratch. jasna's silent finish reads+writes ~2 GB
+            # each; local disk is far faster and the preview watcher polls a local dir.
+            # decensor+upscale already used a local mid_dir (upscale writes the final to
+            # the NAS); decensor now does too, and we copy only the finished file back.
+            mid_dir = os.path.join(CFG["local_temp"], "mid_" + jid)
+            os.makedirs(mid_dir, exist_ok=True)
             # ---- live segment preview (opt-in): scan mosaics -> smart mode -> tap fragments
             preview_on = bool(o.get("preview") or CFG.get("jasna_preview"))
             seg_string, seg_ranges, seg_codec = "", None, ""
@@ -859,6 +873,27 @@ def run_job(lane, job):
                     if o.get("no_trt") or not CFG.get("upscale_trt", True):
                         argv.append("--no-trt")
                     rc, cancelled = _stream_subprocess(lane, jid, argv, scale=(1, n_phases))
+            elif not chain and rc == 0 and not cancelled:
+                # decensor-only: jasna assembled locally in mid_dir; copy just the finished
+                # file to the NAS scratch (out_dir) for the coordinator to import. Write to
+                # a .partial name + atomic replace so _newest_video never sees a half-copy.
+                produced_local = _newest_video(mid_dir)
+                if not produced_local:
+                    rc = 1
+                    push_log(jid, "decensor produced no output", "error")
+                else:
+                    dest = os.path.join(out_dir, os.path.basename(produced_local))
+                    tmp_dest = dest + ".partial"
+                    push_log(jid, "assembled locally; copying result to NAS (%.1f GB)..."
+                             % (os.path.getsize(produced_local) / (1 << 30)), "event")
+                    try:
+                        _copy_with_progress(jid, produced_local, tmp_dest,
+                                            label="Copying result to NAS", stage=op, hold=1.0)
+                        os.replace(tmp_dest, dest)
+                    except OSError as exc:
+                        rc = 1
+                        push_log(jid, "copy to NAS failed: %s" % exc, "error")
+                        _purge(tmp_dest)
         else:
             raise RuntimeError("unsupported op on this runner: " + op)
     finally:
